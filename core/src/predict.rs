@@ -235,7 +235,7 @@ pub fn predict(idx: &Index, lm: &Lm, lam: f64, v: &str, units: &[Unit], mode: Mo
         let syls = &idx.pool[idx.off[e.rd as usize] as usize..idx.off[e.rd as usize + 1] as usize];
         if (compat_prefix(units, syls, &idx.syls) || (mode == Mode::PA && compat_abbr(units, syls, &idx.syls))) && seen.insert(e.wix) {
             let wid = (e.wid != u32::MAX).then_some(e.wid);
-            tiers[if wid.is_some_and(|w| succ.binary_search(&w).is_ok()) { 0 } else { 1 }].push((lm.word_by_id(lam, ctx, wid, e.lp), e));
+            tiers[if wid.is_some_and(|w| succ.contains(w)) { 0 } else { 1 }].push((lm.word_by_id(lam, ctx, wid, e.lp), e));
         }
     }
     let mut out: Vec<(&Ent, f64, bool)> = Vec::new();

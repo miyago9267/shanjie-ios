@@ -82,18 +82,18 @@ impl Drop for Mapped {
     }
 }
 
-/// Where a table's bytes live: the mapping the shipping path uses, or memory (tests, `Lm::add_tri`).
-pub(crate) enum TriBytes {
+/// Where a model file's bytes live: the mapping the shipping path uses, or memory (tests, `Lm::parse`, `Lm::add_tri`).
+pub(crate) enum Bytes {
     Map(Mapped),
     Mem(Vec<u8>),
 }
 
-impl Deref for TriBytes {
+impl Deref for Bytes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         match self {
-            TriBytes::Map(m) => m,
-            TriBytes::Mem(v) => v,
+            Bytes::Map(m) => m,
+            Bytes::Mem(v) => v,
         }
     }
 }
@@ -111,7 +111,7 @@ pub(crate) struct Tri {
     v: u64,
     d: f64,
     c: usize,
-    raw: TriBytes,
+    raw: Bytes,
     /// Section offsets into `raw`: key, total, off, next, count.
     at: [usize; 5],
     /// `+tri:<sha8 of the file>` (the summary-line tag), hashed on first use.
@@ -132,7 +132,7 @@ pub(crate) struct TriMemo(pub(crate) std::collections::HashMap<(u32, u32), Optio
 
 impl Tri {
     /// `raw` is the whole file; `v` and `model_sha` (hex) are the bigram model it must be bound to.
-    pub(crate) fn parse(raw: TriBytes, v: usize, model_sha: &str) -> Result<Tri, LmError> {
+    pub(crate) fn parse(raw: Bytes, v: usize, model_sha: &str) -> Result<Tri, LmError> {
         let bad = LmError::TriTable;
         let u32_at = |p: usize| raw.get(p..p + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
         if raw.len() < HEAD + 4 || &raw[..8] != MAGIC {
@@ -206,7 +206,7 @@ impl Tri {
     /// Whether the bytes are a file mapping (what `Lm::load_opts` must give; the tests look at it).
     #[cfg(test)]
     pub(crate) fn is_mapped(&self) -> bool {
-        matches!(self.raw, TriBytes::Map(_))
+        matches!(self.raw, Bytes::Map(_))
     }
 
     /// The tag `+tri:<sha8 of the file>` (same text as reference/proto/lm_eval.py).

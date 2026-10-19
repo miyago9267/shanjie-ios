@@ -1,6 +1,6 @@
 # 契約：iOS 鍵盤（ios-keyboard）
 
-狀態：草稿（2026-10-19，等維護者確認）。
+狀態：草稿（2026-10-19，等維護者確認）；修訂一（2026-10-19：`Lm` 改成從映射讀、iOS 不放 `digits.tsv`，見 §1 記憶體）已實作。
 
 ## 0. 依據
 
@@ -10,7 +10,10 @@
 
 ## 1. 已知限制（決定順序的事實）
 
-- **記憶體**：macOS 版重播在沒有 trigram 時 max RSS 約 287 MB（`docs/contracts/trigram-mmap.md` §0）。`core/src/lm.rs` 仍用 `std::fs::read` 把 `bigram.sjlm`（83,445,569 bytes）、`classes.sjc`、`kn.sjkn`、`tinylm.sjtl`（14,638,352 bytes）讀進 heap。keyboard extension 超過系統上限就被 jetsam 結束；上限依機型與 iOS 版本不同，〔未確認，spike 要量〕。對策沿用 trigram-mmap：唯讀映射的乾淨頁不算 phys_footprint。
+- **記憶體**：macOS 版重播在沒有 trigram 時 max RSS 約 287 MB（`docs/contracts/trigram-mmap.md` §0）。keyboard extension 超過系統上限就被 jetsam 結束；對策沿用 trigram-mmap：唯讀映射的乾淨頁不算 phys_footprint。
+  - **修訂一（2026-10-19，更正）**：commit 13a5740 以為所有模型檔都改成映射了，其實 `Lm::parse` 仍把 `bigram.sjlm`（83,445,569 bytes）的每個陣列（`nxt`、`cnt` 共 9.10M 條邊 × 8 B ≈ 69 MB，加 `off`、`ctx_id`、`uni`、詞表）、`classes.sjc`、`kn.sjkn` 複製進 heap，函式回傳前才放掉映射，等於沒省。實機：iPhone 17 上 extension 約在 177 MiB 被 jetsam 結束（per-process limit，由 rpages 推論，不是直接讀到的上限）；Mac 上重現同樣的載入（`Engine::new` 加 `load_lm`、不載 trigram 與 tinylm、含 `digits.tsv`），phys_footprint 214 MB。
+  - 維護者 2026-10-19 選：`Lm` 從映射讀，加上 iOS 不放 `digits.tsv`。`Lm`、`classes.sjc`、`kn.sjkn` 各持有映射，陣列以不對齊的 little-endian 讀取就地讀（檔案格式不變；測試用 `Vec<u8>` 來源照舊）；載入時算出的 `ctx_total`、`ctx_back` 與詞的位置留在 heap（約 7 MB）。`digits.tsv` 缺檔只會讓數字功能關閉（`digits.md` A.3.2；`Engine::new` 用 `.ok()` 讀，FFI 走同一條路），`ios/scripts/copy-resources.sh` 不再複製它。
+  - 量測（Mac 複製載入，release，phys_footprint）：修正前 214 MB（不放 `digits.tsv` 約 203 MB）；修正後不放 `digits.tsv` 116 MB（`Engine::new` 後 68 MB，`load_lm` 後 115 MB，打 50 鍵後 116 MB）。dev302 重播的選字與每鍵 p95 沒變。實機 footprint 仍待維護者在 §3 第 4 項量。
 - **交叉編譯**：2026-10-19 在 `aarch64-apple-ios` 編 `core` 有 7 個錯誤，都是 `core/src/learn_store.rs` 的 `O_NOFOLLOW`、`O_NONBLOCK`、`ELOOP`、`barrier` 只用 `cfg(target_os = "macos")` 定義；`core/src/tinylm.rs` 也有 macOS 專用的 cfg。iOS 的 `<fcntl.h>` 值與 macOS 相同〔推論，spike 用單元測試核對〕。
 - **Full Access（RequestsOpenAccess）**：網路（搜尋、雲端翻譯）、App Group 共用容器、讀 `UIPasteboard.general` 都要它；振動（`UIImpactFeedbackGenerator`）在 keyboard extension 是否也要它〔未確認，實機驗〕。按鍵音用 `UIInputViewAudioFeedback` 與 `playInputClick()`，不需要 Full Access。沒開 Full Access 時打字、選字、主題、佈局、按鍵音都要能用；選字記憶改存 extension 自己的容器。
 - **剪貼簿**：extension 沒辦法在背景監聽剪貼簿，歷史只能在鍵盤出現時以 `changeCount` 抓一次；iOS 16 以後是否跳貼上提示〔未確認，實機驗〕。可靠的部分是使用者自己釘選的片段。

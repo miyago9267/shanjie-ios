@@ -3,7 +3,7 @@
 //! R2: errors carry no content; nothing here formats input text.
 
 use crate::learn::{context_key, newword_score, record_key, Learner, Level, NEWWORD_MAX, NEWWORD_MIN};
-use crate::trigram::{Mapped, Tri, TriBytes, TriCtx, TriMemo};
+use crate::trigram::{Bytes, Mapped, Tri, TriCtx, TriMemo};
 use crate::{Error, Lexicon, PER_KEY};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -75,9 +75,9 @@ fn map_beside(model: &Path, name: &str) -> Result<Option<Mapped>, ()> {
     }
 }
 
-/// Maps a model file read-only instead of reading it onto the heap (docs/contracts/ios-keyboard.md section 2: the pages are clean
-/// file-backed pages, not phys_footprint). Everything but the trigram table is parsed into typed arrays and the mapping dropped
-/// before `load_opts` returns, so these files are only read during the call.
+/// Maps a model file read-only instead of reading it onto the heap (docs/contracts/ios-keyboard.md section 1: the pages are clean
+/// file-backed pages, not phys_footprint). `Lm`, its class file, the Kneser-Ney side file and the trigram table keep the mapping and
+/// read their arrays in place; only what is derived at load time (per-context totals and back-off weights, word spans) is on the heap.
 fn map_model_file(path: &Path) -> Result<Mapped, ()> {
     // SAFETY: nothing rewrites these files in place while they are mapped; the App's Resources and a user's data/lm are replaced
     // only by rename (see `Mapped::open`).
@@ -107,19 +107,30 @@ impl fmt::Display for LmError {
 impl std::error::Error for LmError {}
 
 /// Bigram model. Context `i` owns `nxt/cnt[off[i]..off[i+1]]`, ascending by next id.
+///
+/// The arrays are read in place from `raw`, the whole model file (a read-only mapping, or memory in tests): the file's own
+/// little-endian layout is not aligned (words come first), so every item is an unaligned `from_le_bytes` read. `*_at` are byte
+/// offsets into `raw`; `parse` checked that every array lies inside it and holds the counts below, so the lookups cannot go out of range.
 pub struct Lm {
     n: u64,
     d: f64,
     p_eos: f64,
-    pool: Vec<u8>,
-    voff: Vec<u32>,
-    uni: Vec<u64>,
-    ctx_id: Vec<u32>,
+    raw: Bytes,
+    /// Vocabulary size V, contexts C, edges E.
+    v: usize,
+    c: usize,
+    e: usize,
+    /// `raw` range of each word's UTF-8 text.
+    words: Vec<(u32, u32)>,
+    /// u64[V], u32[C], u32[C+1], u32[E], u32[E].
+    uni_at: usize,
+    ctx_id_at: usize,
+    off_at: usize,
+    nxt_at: usize,
+    cnt_at: usize,
+    /// Derived at load, not in the file.
     ctx_total: Vec<f64>,
     ctx_back: Vec<f64>,
-    off: Vec<u32>,
-    nxt: Vec<u32>,
-    cnt: Vec<u32>,
     /// S2k word-class term (classes.sjc); `None` only for the explicit class-less constructors.
     classes: Option<Classes>,
     /// SHA-256 (hex) of the model bytes, taken once in `parse`: classes.sjc and kn.sjkn are bound to it.
@@ -138,7 +149,7 @@ struct Kn {
     theta: u32,
     total: u64,
     /// The whole file, the bytes `add_kn` checked; N is read in place (little-endian u32 at `KN_N + 4 * id`), so nothing is copied.
-    raw: Vec<u8>,
+    raw: Bytes,
     /// SHA-256 of `raw` and `+kn:<its sha8>:θ<θ>:β<β>` (the suffix of lm_eval.py's summary line), computed on first use.
     hashed: OnceLock<([u8; 32], String)>,
 }
@@ -166,9 +177,49 @@ impl Kn {
 struct Classes {
     k3: usize,
     mu: f64,
-    cls: Vec<u16>,
-    emit: Vec<f64>,
-    pc: Vec<f64>,
+    /// The file (mapping or memory); `cls` u16[V], `emit` f64[V] and `pc` f64[k3 * k3] are read in place at these offsets.
+    raw: Bytes,
+    cls_at: usize,
+    emit_at: usize,
+    pc_at: usize,
+}
+
+impl Classes {
+    fn cls(&self, id: usize) -> u16 {
+        u16::from_le_bytes(self.raw[self.cls_at + 2 * id..][..2].try_into().unwrap())
+    }
+    fn emit(&self, id: usize) -> f64 {
+        le_f64(&self.raw, self.emit_at + 8 * id)
+    }
+    fn pc(&self, i: usize) -> f64 {
+        le_f64(&self.raw, self.pc_at + 8 * i)
+    }
+}
+
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+fn le_f64(b: &[u8], at: usize) -> f64 {
+    f64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+/// `n` little-endian u32 at `at`, as items of 4 bytes (alignment 1, so any offset works).
+fn u32s(b: &[u8], at: usize, n: usize) -> &[[u8; 4]] {
+    b[at..at + 4 * n].as_chunks().0
+}
+
+fn by_u32(w: u32) -> impl Fn(&[u8; 4]) -> std::cmp::Ordering {
+    move |x| u32::from_le_bytes(*x).cmp(&w)
+}
+
+/// Ids of the words listed after a context, ascending (`Lm::successor_ids`).
+pub struct Succ<'a>(&'a [[u8; 4]]);
+
+impl Succ<'_> {
+    pub fn contains(&self, w: u32) -> bool {
+        self.0.binary_search_by(by_u32(w)).is_ok()
+    }
 }
 
 const CLASS_MAGIC: &[u8; 8] = b"SJCL0001";
@@ -224,15 +275,9 @@ impl<'a> Rd<'a> {
     fn f64(&mut self) -> Result<f64, LmError> {
         Ok(f64::from_le_bytes(self.arr()?))
     }
-    fn vec<T>(&mut self, n: usize, w: usize, f: impl Fn(&[u8]) -> T) -> Result<Vec<T>, LmError> {
-        let bytes = self.take(n.checked_mul(w).ok_or(LmError::Format)?)?;
-        Ok(bytes.chunks_exact(w).map(f).collect())
-    }
-    fn u32s(&mut self, n: usize) -> Result<Vec<u32>, LmError> {
-        self.vec(n, 4, |c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-    }
-    fn u64s(&mut self, n: usize) -> Result<Vec<u64>, LmError> {
-        self.vec(n, 8, |c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+    /// Offset (in the whole file) of the next unread byte, given the whole file `all`.
+    fn pos(&self, all: &[u8]) -> usize {
+        all.len() - self.0.len()
     }
 }
 
@@ -244,7 +289,7 @@ impl Lm {
 
     /// Cheap fingerprint of the loaded model (sizes of its tables), to tell two models apart.
     pub fn identity(&self) -> (u64, usize, usize) {
-        (self.n, self.voff.len(), self.nxt.len())
+        (self.n, self.v + 1, self.e)
     }
 
     /// The model at `path` and the `classes.sjc` beside it (S2k section 4.3). A missing or mismatching class
@@ -270,15 +315,14 @@ impl Lm {
     /// (a dangling symlink included) but cannot be read or does not match the model is `TriTable`; no such path is off.
     pub fn load_opts(path: &Path, classes: bool, kn: bool, tri: bool) -> Result<Lm, LmError> {
         let model = map_model_file(path).map_err(|()| LmError::Io)?;
-        let mut lm = if classes {
+        let mut lm = Lm::parse_bytes(Bytes::Map(model))?;
+        if classes {
             let c = map_model_file(&path.with_file_name("classes.sjc")).map_err(|()| LmError::Io)?;
-            Lm::parse_with_classes(&model, &c)?
-        } else {
-            Lm::parse(&model)?
-        };
+            lm.add_classes(Bytes::Map(c))?;
+        }
         if kn {
             if let Some(side) = map_beside(path, "kn.sjkn").map_err(|_| LmError::KnSide)? {
-                lm.add_kn(&side)?;
+                lm.add_kn_bytes(Bytes::Map(side))?;
             }
         }
         if tri {
@@ -288,7 +332,7 @@ impl Lm {
                 // replaced only by rename (scripts/install-ime.sh, the installer, the Homebrew cask), and tools/build_trigram.py writes a
                 // temp file and renames it onto the target.
                 let map = unsafe { Mapped::open(&side) }.map_err(|()| LmError::TriTable)?;
-                lm.add_tri_bytes(TriBytes::Map(map))?;
+                lm.add_tri_bytes(Bytes::Map(map))?;
             }
         }
         Ok(lm)
@@ -299,18 +343,22 @@ impl Lm {
     /// header sum of N' between the largest N' and the sum of all N' over ids >= 2 (a correct file always is: the sum counts
     /// each variant class once). Turns the Kneser-Ney term on.
     pub fn add_kn(&mut self, side: &[u8]) -> Result<(), LmError> {
+        self.add_kn_bytes(Bytes::Mem(side.to_vec()))
+    }
+
+    fn add_kn_bytes(&mut self, side: Bytes) -> Result<(), LmError> {
         let bad = |_| LmError::KnSide;
-        let mut r = Rd(side);
+        let mut r = Rd(&side);
         if r.take(8).map_err(bad)? != KN_MAGIC {
             return Err(LmError::KnSide);
         }
         let v = r.u32().map_err(bad)? as usize;
         let want: String = r.take(32).map_err(bad)?.iter().map(|b| format!("{b:02x}")).collect();
         let (theta, beta, total) = (r.u32().map_err(bad)?, r.f64().map_err(bad)?, r.u64().map_err(bad)?);
-        if v != self.uni.len() || want != self.sha || !(0.0..=1.0).contains(&beta) || side.len() != KN_N + 4 * v {
+        if v != self.v || want != self.sha || !(0.0..=1.0).contains(&beta) || side.len() != KN_N + 4 * v {
             return Err(LmError::KnSide);
         }
-        let kn = Kn { beta, theta, total, raw: side.to_vec(), hashed: OnceLock::new() };
+        let kn = Kn { beta, theta, total, raw: side, hashed: OnceLock::new() };
         let (mut max, mut sum) = (0u64, 0u128);
         for id in 2..v {
             let n = kn.np1(id);
@@ -341,11 +389,11 @@ impl Lm {
     /// V, the hash of the model this `Lm` was parsed from, D, exact length, and the order and range of every key, offset and next id.
     /// Turns the trigram level on for the formal profile.
     pub fn add_tri(&mut self, table: Vec<u8>) -> Result<(), LmError> {
-        self.add_tri_bytes(TriBytes::Mem(table))
+        self.add_tri_bytes(Bytes::Mem(table))
     }
 
-    fn add_tri_bytes(&mut self, table: TriBytes) -> Result<(), LmError> {
-        self.tri = Some(Tri::parse(table, self.uni.len(), &self.sha)?);
+    fn add_tri_bytes(&mut self, table: Bytes) -> Result<(), LmError> {
+        self.tri = Some(Tri::parse(table, self.v, &self.sha)?);
         Ok(())
     }
 
@@ -353,6 +401,12 @@ impl Lm {
     #[cfg(test)]
     pub(crate) fn tri_is_mapped(&self) -> Option<bool> {
         self.tri.as_ref().map(Tri::is_mapped)
+    }
+
+    /// Whether the model and its class file are file mappings (`None`: no class file). For the tests of `load_opts`.
+    #[cfg(test)]
+    pub(crate) fn model_is_mapped(&self) -> (bool, Option<bool>) {
+        (matches!(self.raw, Bytes::Map(_)), self.classes.as_ref().map(|c| matches!(c.raw, Bytes::Map(_))))
     }
 
     /// The summary-line suffix `+tri:<table sha8>` (same text as reference/proto/lm_eval.py); `None` without a table. The file is
@@ -370,36 +424,54 @@ impl Lm {
     }
 
     /// Model bytes plus classes.sjc bytes: magic, the model's SHA-256, the vocabulary size and the exact length must match.
+    /// Both are copied; `load_opts` maps the files instead.
     pub fn parse_with_classes(model: &[u8], classes: &[u8]) -> Result<Lm, LmError> {
         let mut lm = Lm::parse(model)?;
-        let sha = lm.sha.clone();
-        let mut r = Rd(classes);
+        lm.add_classes(Bytes::Mem(classes.to_vec()))?;
+        Ok(lm)
+    }
+
+    fn add_classes(&mut self, classes: Bytes) -> Result<(), LmError> {
+        let mut r = Rd(&classes);
         if r.take(8)? != CLASS_MAGIC {
             return Err(LmError::Format);
         }
         let want: String = r.take(32)?.iter().map(|b| format!("{b:02x}")).collect();
         let (k, mu, v) = (r.u32()? as usize, r.f64()?, r.u32()? as usize);
-        if want != sha || v != lm.uni.len() || !(0.0..=1.0).contains(&mu) {
+        if want != self.sha || v != self.v || !(0.0..=1.0).contains(&mu) {
             return Err(LmError::Format);
         }
         let k3 = k.checked_add(3).ok_or(LmError::Format)?;
-        let cls = r.vec(v, 2, |c| u16::from_le_bytes([c[0], c[1]]))?;
-        let emit = r.vec(v, 8, |c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))?;
-        let pc = r.vec(k3.checked_mul(k3).ok_or(LmError::Format)?, 8, |c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))?;
+        let (cls_at, cls) = (r.pos(&classes), r.take(v.checked_mul(2).ok_or(LmError::Format)?)?);
+        let (emit_at, emit) = (r.pos(&classes), r.take(v.checked_mul(8).ok_or(LmError::Format)?)?);
+        let (pc_at, pc) = (r.pos(&classes), r.take(k3.checked_mul(k3).and_then(|x| x.checked_mul(8)).ok_or(LmError::Format)?)?);
         // The model hash binds the file to the model, not its numbers: a probability outside [0, 1] or a
         // class id out of range is a malformed file, never a silently wrong ranking.
-        let prob_ok = |x: &f64| (0.0..=1.0).contains(x);
-        if !r.0.is_empty() || cls.iter().any(|&c| c != NO_CLASS && c as usize >= k3) || !emit.iter().all(prob_ok) || !pc.iter().all(prob_ok) {
+        let prob_ok = |c: &[u8]| (0.0..=1.0).contains(&f64::from_le_bytes(c.try_into().unwrap()));
+        if !r.0.is_empty()
+            || cls.chunks_exact(2).any(|c| {
+                let c = u16::from_le_bytes([c[0], c[1]]);
+                c != NO_CLASS && c as usize >= k3
+            })
+            || !emit.chunks_exact(8).all(prob_ok)
+            || !pc.chunks_exact(8).all(prob_ok)
+        {
             return Err(LmError::Format);
         }
-        lm.classes = Some(Classes { k3, mu, cls, emit, pc });
-        Ok(lm)
+        self.classes = Some(Classes { k3, mu, raw: classes, cls_at, emit_at, pc_at });
+        Ok(())
     }
 
     /// Format in tools/build_lm.py. Beyond magic, sizes and trailing bytes, the invariants the lookups
     /// rely on (sorted vocab and entries, offsets in range, ids below V) are checked so no index can panic.
+    /// The bytes are copied; `load_opts` maps the file instead.
     pub fn parse(bytes: &[u8]) -> Result<Lm, LmError> {
-        let mut r = Rd(bytes);
+        Lm::parse_bytes(Bytes::Mem(bytes.to_vec()))
+    }
+
+    fn parse_bytes(raw: Bytes) -> Result<Lm, LmError> {
+        let all: &[u8] = &raw;
+        let mut r = Rd(all);
         if r.take(8)? != b"SJLM0001" {
             return Err(LmError::Format);
         }
@@ -408,79 +480,87 @@ impl Lm {
         if v < 2 || n == 0 || !d.is_finite() {
             return Err(LmError::Format);
         }
-        let mut pool = Vec::new();
-        let mut voff = Vec::with_capacity(v + 1);
-        voff.push(0u32);
+        let mut words = Vec::with_capacity(v);
         for _ in 0..v {
             let len = r.u16()? as usize;
+            let at = r.pos(all);
             let w = r.take(len)?;
             std::str::from_utf8(w).map_err(|_| LmError::Format)?;
-            pool.extend_from_slice(w);
-            voff.push(u32::try_from(pool.len()).map_err(|_| LmError::Format)?);
+            words.push((u32::try_from(at).map_err(|_| LmError::Format)?, u32::try_from(at + len).map_err(|_| LmError::Format)?));
         }
-        let word = |i: usize| &pool[voff[i] as usize..voff[i + 1] as usize];
+        let word = |i: usize| &all[words[i].0 as usize..words[i].1 as usize];
         if word(0) != b"<s>" || word(1) != b"</s>" || (3..v).any(|i| word(i - 1) >= word(i)) {
             return Err(LmError::Format);
         }
-        let uni = r.u64s(v)?;
+        let uni_at = r.pos(all);
+        r.take(v.checked_mul(8).ok_or(LmError::Format)?)?;
         let c = r.u32()? as usize;
-        let ctx_id = r.u32s(c)?;
-        let ctx_tot = r.u64s(c)?;
-        let off = r.u32s(c.checked_add(1).ok_or(LmError::Format)?)?;
+        let ctx_id_at = r.pos(all);
+        let ctx_id = r.take(c.checked_mul(4).ok_or(LmError::Format)?)?.as_chunks::<4>().0;
+        let ctx_tot = r.take(c.checked_mul(8).ok_or(LmError::Format)?)?;
+        let off_at = r.pos(all);
+        let off = r.take(c.checked_add(1).and_then(|x| x.checked_mul(4)).ok_or(LmError::Format)?)?.as_chunks::<4>().0;
         let e = r.u32()? as usize;
-        let nxt = r.u32s(e)?;
-        let cnt = r.u32s(e)?;
+        let nxt_at = r.pos(all);
+        let nxt = r.take(e.checked_mul(4).ok_or(LmError::Format)?)?.as_chunks::<4>().0;
+        let cnt_at = r.pos(all);
+        let cnt = r.take(e.checked_mul(4).ok_or(LmError::Format)?)?.as_chunks::<4>().0;
         if !r.0.is_empty() {
             return Err(LmError::Format);
         }
+        let (u32v, u64v) = (|x: &[u8; 4]| u32::from_le_bytes(*x), |x: &[u8]| u64::from_le_bytes(x.try_into().unwrap()));
         let vmax = v as u32;
-        if ctx_id.iter().any(|&i| i >= vmax) || ctx_id.windows(2).any(|w| w[0] >= w[1]) {
+        if ctx_id.iter().any(|x| u32v(x) >= vmax) || ctx_id.windows(2).any(|w| u32v(&w[0]) >= u32v(&w[1])) {
             return Err(LmError::Format);
         }
-        if off[0] != 0 || off[c] as usize != e || off.windows(2).any(|w| w[0] > w[1]) || ctx_tot.contains(&0) {
+        if u32v(&off[0]) != 0 || u32v(&off[c]) as usize != e || off.windows(2).any(|w| u32v(&w[0]) > u32v(&w[1])) || ctx_tot.chunks_exact(8).any(|x| u64v(x) == 0) {
             return Err(LmError::Format);
         }
-        if nxt.iter().any(|&i| i >= vmax) {
+        if nxt.iter().any(|x| u32v(x) >= vmax) {
             return Err(LmError::Format);
         }
         let mut ctx_total = Vec::with_capacity(c);
         let mut ctx_back = Vec::with_capacity(c);
         for i in 0..c {
-            let range = off[i] as usize..off[i + 1] as usize;
-            if nxt[range.clone()].windows(2).any(|w| w[0] >= w[1]) {
+            let range = u32v(&off[i]) as usize..u32v(&off[i + 1]) as usize;
+            if nxt[range.clone()].windows(2).any(|w| u32v(&w[0]) >= u32v(&w[1])) {
                 return Err(LmError::Format);
             }
             // back(v): sum (count - D) in file order, then divide once.
             let mut kept_sum = 0.0f64;
             for j in range {
-                kept_sum += cnt[j] as f64 - d;
+                kept_sum += u32v(&cnt[j]) as f64 - d;
             }
-            let t = ctx_tot[i] as f64;
+            let t = u64v(&ctx_tot[8 * i..8 * i + 8]) as f64;
             ctx_total.push(t);
             ctx_back.push(1.0 - kept_sum / t);
         }
+        let sha = crate::eval::sha256_hex(all);
         Ok(Lm {
             n,
             d,
             p_eos: eos_total as f64 / n as f64,
-            pool,
-            voff,
-            uni,
-            ctx_id,
+            v,
+            c,
+            e,
+            words,
+            uni_at,
+            ctx_id_at,
+            off_at,
+            nxt_at,
+            cnt_at,
             ctx_total,
             ctx_back,
-            off,
-            nxt,
-            cnt,
+            raw,
             classes: None,
-            sha: crate::eval::sha256_hex(bytes),
+            sha,
             kn: None,
             tri: None,
         })
     }
 
     fn vocab_word(&self, i: usize) -> &[u8] {
-        &self.pool[self.voff[i] as usize..self.voff[i + 1] as usize]
+        &self.raw[self.words[i].0 as usize..self.words[i].1 as usize]
     }
 
     /// Vocabulary id; ids 0 and 1 are the sentence markers, the rest are sorted by UTF-8 bytes.
@@ -490,7 +570,7 @@ impl Lm {
             "</s>" => return Some(1),
             _ => {}
         }
-        let (mut lo, mut hi) = (2usize, self.uni.len());
+        let (mut lo, mut hi) = (2usize, self.v);
         while lo < hi {
             let mid = (lo + hi) / 2;
             match self.vocab_word(mid).cmp(w.as_bytes()) {
@@ -503,7 +583,7 @@ impl Lm {
     }
 
     fn ctx_of(&self, id: Option<u32>) -> Ctx {
-        Ctx { id, idx: id.and_then(|id| self.ctx_id.binary_search(&id).ok()) }
+        Ctx { id, idx: id.and_then(|id| u32s(&self.raw, self.ctx_id_at, self.c).binary_search_by(by_u32(id)).ok()) }
     }
 
     /// P(w | context) with the backoff distribution value `pb` (lm.py `prob`): the one probability function every
@@ -537,18 +617,18 @@ impl Lm {
         let back = match ctx.idx {
             None => 1.0,
             Some(i) => {
-                let range = self.off[i] as usize..self.off[i + 1] as usize;
-                let found = w.and_then(|w| self.nxt[range.clone()].binary_search(&w).ok());
-                if let Some(k) = found.map(|j| self.cnt[range.start + j]).filter(|&k| k != 0) {
+                let range = self.edges(i);
+                let found = w.and_then(|w| u32s(&self.raw, self.nxt_at + 4 * range.start, range.len()).binary_search_by(by_u32(w)).ok());
+                if let Some(k) = found.map(|j| le32(&self.raw, self.cnt_at + 4 * (range.start + j))).filter(|&k| k != 0) {
                     return (k as f64 - self.d) / self.ctx_total[i] + self.ctx_back[i] * pb;
                 }
                 self.ctx_back[i]
             }
         };
         if let (Some(c), Some(v), Some(w)) = (&self.classes, ctx.id, w) {
-            let (cv, cw) = (c.cls[v as usize], c.cls[w as usize]);
+            let (cv, cw) = (c.cls(v as usize), c.cls(w as usize));
             if cv != NO_CLASS && cw != NO_CLASS {
-                return back * ((1.0 - c.mu) * pb + c.mu * c.pc[cv as usize * c.k3 + cw as usize] * c.emit[w as usize]);
+                return back * ((1.0 - c.mu) * pb + c.mu * c.pc(cv as usize * c.k3 + cw as usize) * c.emit(w as usize));
             }
         }
         back * pb
@@ -638,7 +718,7 @@ impl Lm {
 
     /// Unigram count (0 for unknown words).
     pub fn count(&self, w: &str) -> u64 {
-        self.word_id(w).map_or(0, |i| self.uni[i as usize])
+        self.word_id(w).map_or(0, |i| u64::from_le_bytes(self.raw[self.uni_at + 8 * i as usize..][..8].try_into().unwrap()))
     }
 
     /// Total unigram count N.
@@ -647,9 +727,15 @@ impl Lm {
     }
 
     /// Ids of the words listed after `v` in the model, ascending; empty when `v` has no context entry.
-    pub fn successor_ids(&self, v: &str) -> &[u32] {
-        let range = self.ctx_of(self.word_id(v)).idx.map_or(0..0, |i| self.off[i] as usize..self.off[i + 1] as usize);
-        &self.nxt[range]
+    pub fn successor_ids(&self, v: &str) -> Succ<'_> {
+        let range = self.ctx_of(self.word_id(v)).idx.map_or(0..0, |i| self.edges(i));
+        Succ(u32s(&self.raw, self.nxt_at + 4 * range.start, range.len()))
+    }
+
+    /// Context `i`'s range into the `nxt`/`cnt` edge arrays.
+    fn edges(&self, i: usize) -> std::ops::Range<usize> {
+        let o = u32s(&self.raw, self.off_at + 4 * i, 2);
+        u32::from_le_bytes(o[0]) as usize..u32::from_le_bytes(o[1]) as usize
     }
 
     /// `word` for a caller that looked the ids up once: `ctx` from `context_of(v)`, `w` from `word_id`.
@@ -1714,6 +1800,37 @@ mod tests {
         let mut other = model.clone();
         other[20] ^= 1;
         assert_eq!(Lm::parse(&other).unwrap().add_tri(good).err(), Some(LmError::TriTable));
+    }
+
+    /// docs/contracts/ios-keyboard.md section 1: `load_opts` keeps the model and class file mapped and reads them in place (the source kind
+    /// is checked, not only the result); every lookup equals the one on the same bytes parsed from memory, bit for bit.
+    #[test]
+    fn load_opts_reads_the_model_in_place() {
+        let dir = std::env::temp_dir().join(format!("shanjie-lm-inplace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (model, m) = (tiny(), dir.join("tiny.sjlm"));
+        std::fs::write(&m, &model).unwrap();
+        std::fs::write(dir.join("classes.sjc"), tiny_classes(&model)).unwrap();
+        let mapped = Lm::load_opts(&m, true, true, true).unwrap();
+        assert_eq!(mapped.model_is_mapped(), (true, Some(true)), "load_opts must map both files, not read them");
+        assert_eq!(Lm::load_opts(&m, false, true, true).unwrap().model_is_mapped(), (true, None));
+        let mem = classed();
+        assert_eq!(mem.model_is_mapped(), (false, Some(false)));
+        assert_eq!((mapped.identity(), mapped.sha256()), (mem.identity(), mem.sha256()));
+        for v in ["<s>", "a", "b", "</s>", "nope"] {
+            assert_eq!(mapped.count(v), mem.count(v), "count {v}");
+            assert_eq!(mapped.word_id(v), mem.word_id(v), "id {v}");
+            assert_eq!(mapped.eos(0.5, v).to_bits(), mem.eos(0.5, v).to_bits(), "eos {v}");
+            for w in ["<s>", "a", "b", "</s>", "nope"] {
+                assert_eq!(mapped.prob(v, w, 0.1).to_bits(), mem.prob(v, w, 0.1).to_bits(), "{v} {w}");
+                assert_eq!(mapped.word(0.5, v, w, -1.0).to_bits(), mem.word(0.5, v, w, -1.0).to_bits(), "word {v} {w}");
+            }
+            for id in 0..5 {
+                assert_eq!(mapped.successor_ids(v).contains(id), mem.successor_ids(v).contains(id), "succ {v} {id}");
+            }
+        }
+        assert!(mapped.successor_ids("<s>").contains(2) && mapped.successor_ids("<s>").contains(3) && !mapped.successor_ids("<s>").contains(0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// docs/contracts/trigram-mmap.md section 3.2: `load_opts` maps `trigram.sjt3` (the source kind is checked, not only the result), the mapped
