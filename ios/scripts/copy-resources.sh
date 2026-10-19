@@ -12,3 +12,5 @@ for f in mcbpmf-data.txt overlay-add.tsv sandhi-add.tsv names-add.tsv demote.tsv
   cp "$REPO/data/lexicon/$f" "$DEST/"
 done
 cp -L "$REPO/data/lm/bigram.sjlm" "$REPO/data/lm/classes.sjc" "$REPO/data/lm/kn.sjkn" "$DEST/"
+# Incremental builds keep a digits.tsv copied before it was excluded; remove the stale one.
+rm -f "$DEST/digits.tsv"
