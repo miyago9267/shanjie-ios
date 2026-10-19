@@ -16,3 +16,7 @@ experiments/s5-judges/results/*-n*/
 # worktrees .agent-local is a symlink, which a directory-only pattern would not match.
 .agent-local
 CLAUDE.local.md
+
+# iOS (ios/project.yml is the source; the project, core xcframework and DerivedData are generated)
+/ios/*.xcodeproj
+/ios/build/
