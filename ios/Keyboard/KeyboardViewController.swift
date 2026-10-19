@@ -28,6 +28,7 @@ final class KeyboardViewController: UIInputViewController {
     private let barScroll = UIScrollView()
     private let barStack = UIStackView()
     private let chevron = UIButton(type: .system)
+    private lazy var globe = key("")
     private var display = Display()
     private var deleteTimer: Timer?
 
@@ -146,17 +147,22 @@ final class KeyboardViewController: UIInputViewController {
     @objc private func candidateTapped(_ b: UIButton) { send(.pick(b.tag)) }
     @objc private func chevronTapped() { send(display.selected >= 0 ? .closeCandidates : .openCandidates) }
 
+    override func viewWillLayoutSubviews() {
+        super.viewWillLayoutSubviews()
+        globe.isHidden = !needsInputModeSwitchKey
+    }
+
     private func buildUI() {
         let root = UIStackView()
         root.axis = .vertical
-        root.spacing = 6
+        root.spacing = 5
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 3),
             root.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -3),
-            root.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
-            root.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -4),
+            root.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
+            root.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -2),
         ])
 
         barStack.axis = .horizontal
@@ -164,6 +170,9 @@ final class KeyboardViewController: UIInputViewController {
         barStack.translatesAutoresizingMaskIntoConstraints = false
         barScroll.addSubview(barStack)
         barScroll.showsHorizontalScrollIndicator = false
+        if #available(iOS 26.0, *) {
+            for e in [barScroll.topEdgeEffect, barScroll.bottomEdgeEffect, barScroll.leftEdgeEffect, barScroll.rightEdgeEffect] { e.isHidden = true }
+        }
         chevron.titleLabel?.font = .systemFont(ofSize: 20)
         chevron.addTarget(self, action: #selector(chevronTapped), for: .touchUpInside)
         chevron.widthAnchor.constraint(equalToConstant: 44).isActive = true
@@ -188,11 +197,10 @@ final class KeyboardViewController: UIInputViewController {
                 b.addTarget(self, action: #selector(zhuyinTapped(_:)), for: .touchDown)
                 s.addArrangedSubview(b)
             }
-            s.heightAnchor.constraint(equalToConstant: 44).isActive = true
+            s.heightAnchor.constraint(equalToConstant: 42).isActive = true
             root.addArrangedSubview(s)
         }
 
-        let globe = key("")
         globe.setImage(UIImage(systemName: "globe"), for: .normal)
         globe.tintColor = .label
         globe.addTarget(self, action: #selector(handleInputModeList(from:with:)), for: .allTouchEvents)
@@ -209,7 +217,7 @@ final class KeyboardViewController: UIInputViewController {
         globe.widthAnchor.constraint(equalToConstant: 56).isActive = true
         back.widthAnchor.constraint(equalToConstant: 64).isActive = true
         enter.widthAnchor.constraint(equalToConstant: 72).isActive = true
-        bottom.heightAnchor.constraint(equalToConstant: 44).isActive = true
+        bottom.heightAnchor.constraint(equalToConstant: 42).isActive = true
         root.addArrangedSubview(bottom)
     }
 
