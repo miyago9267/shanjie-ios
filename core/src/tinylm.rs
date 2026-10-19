@@ -14,6 +14,7 @@
 
 use crate::learn::SENTINEL;
 use crate::lm::{Lm, Profile};
+use crate::trigram::Mapped;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -122,22 +123,22 @@ fn valid_params((alpha, tau, delta): (f64, f64, f64)) -> bool {
     alpha.is_finite() && !tau.is_nan() && (0.0..=MAX_DELTA).contains(&delta)
 }
 
-/// How the matrix products and the tanh / exp vectors are computed. `Plain` is the portable path; `Accelerate` is the one used on macOS.
+/// How the matrix products and the tanh / exp vectors are computed. `Plain` is the portable path; `Accelerate` is the one used on macOS and iOS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     Plain,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     Accelerate,
 }
 
 impl Backend {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub const DEFAULT: Backend = Backend::Accelerate;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     pub const DEFAULT: Backend = Backend::Plain;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[link(name = "Accelerate", kind = "framework")]
 extern "C" {
     fn cblas_sgemm(
@@ -153,7 +154,7 @@ pub(crate) fn gemm(be: Backend, a: &[f32], b: &[f32], c: &mut [f32], (m, k, n): 
     // Checked in release too (F6): the Accelerate call reads and writes through raw pointers with these lengths.
     assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "gemm: matrix lengths do not match");
     match be {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         Backend::Accelerate => {
             assert!(m.max(k).max(n) < i32::MAX as usize, "gemm: dimension too large");
             // CblasRowMajor 101, CblasNoTrans 111, CblasTrans 112
@@ -188,7 +189,7 @@ pub(crate) fn gemm(be: Backend, a: &[f32], b: &[f32], c: &mut [f32], (m, k, n): 
 fn tanh_into(be: Backend, x: &[f32], y: &mut [f32]) {
     assert!(x.len() == y.len() && x.len() < i32::MAX as usize, "tanh: lengths do not match");
     match be {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         Backend::Accelerate => unsafe { vvtanhf(y.as_mut_ptr(), x.as_ptr(), &(x.len() as i32)) },
         Backend::Plain => y.iter_mut().zip(x).for_each(|(o, v)| *o = v.tanh()),
     }
@@ -198,7 +199,7 @@ fn tanh_into(be: Backend, x: &[f32], y: &mut [f32]) {
 pub(crate) fn exp_into(be: Backend, x: &[f32], y: &mut [f32]) {
     assert!(x.len() == y.len() && x.len() < i32::MAX as usize, "exp: lengths do not match");
     match be {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         Backend::Accelerate => unsafe { vvexpf(y.as_mut_ptr(), x.as_ptr(), &(x.len() as i32)) },
         Backend::Plain => y.iter_mut().zip(x).for_each(|(o, v)| *o = v.exp()),
     }
@@ -308,10 +309,32 @@ pub(crate) fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, TinyLmError
     Ok(bytes)
 }
 
+/// The bytes of a `.sjtl` as `load_paired` parsed them: a read-only mapping of the file (the weights are copied into typed arrays by
+/// `parse`, so the mapping is only needed while loading).
+pub struct SjtlBytes(Mapped);
+
+impl std::ops::Deref for SjtlBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Maps a regular file of at most `max` bytes read-only, the mapped counterpart of `read_bounded` (same errors: `Io` for an
+/// unopenable, not regular or empty file, `Format` over the cap).
+fn map_bounded(path: &Path, max: u64) -> Result<SjtlBytes, TinyLmError> {
+    // SAFETY: the model file is never rewritten in place while loading (the App's Resources are replaced by rename, see `Mapped::open`).
+    let map = unsafe { Mapped::open(path) }.map_err(|()| TinyLmError::Io)?;
+    if map.len() as u64 > max {
+        return Err(TinyLmError::Format);
+    }
+    Ok(SjtlBytes(map))
+}
+
 impl TinyLm {
-    /// Reads only a regular file of at most `MAX_FILE` bytes (`read_bounded`).
+    /// Maps only a regular file of at most `MAX_FILE` bytes (`map_bounded`).
     pub fn load(path: &Path) -> Result<TinyLm, TinyLmError> {
-        TinyLm::parse(&read_bounded(path, MAX_FILE)?)
+        TinyLm::parse(&map_bounded(path, MAX_FILE)?)
     }
 
     /// The one loader of the engine and the evaluation CLI (S7c-2a): `load`'s checks, then the pairing with `lm` — the n-gram
@@ -319,8 +342,8 @@ impl TinyLm {
     /// versions 1 to 3 and for an all-zero version 4 field) must be the one `lm` has loaded, all 32 bytes, or none when `lm` has none ("loaded" is about the file beside the model, not whether the formal profile scores with it).
     /// A pairing check only, not an integrity check of the `.sjtl`. Also returns the bytes it parsed (the CLI prints their hash;
     /// the engine drops them).
-    pub fn load_paired(path: &Path, lm: &Lm) -> Result<(TinyLm, Vec<u8>), TinyLmError> {
-        let bytes = read_bounded(path, MAX_FILE)?;
+    pub fn load_paired(path: &Path, lm: &Lm) -> Result<(TinyLm, SjtlBytes), TinyLmError> {
+        let bytes = map_bounded(path, MAX_FILE)?;
         let model = TinyLm::parse(&bytes)?;
         if model.ngram_sha256() != lm.sha256() {
             return Err(TinyLmError::OtherNgram);

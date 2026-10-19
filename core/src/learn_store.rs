@@ -42,17 +42,18 @@ pub const MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub const JOURNAL_MAX: usize = 1024;
 
 // <fcntl.h> values. std has no names for them and the crate has no libc dependency; the shipping
-// target is macOS only (CI builds and tests core on macOS). The symlink and FIFO tests in
-// core/tests/learn_store.rs fail if a value is wrong.
-#[cfg(target_os = "macos")]
+// targets are macOS and iOS (CI builds and tests core on macOS; iOS has the same values, checked against the
+// SDK headers by `apple_values_agree` below). The symlink and FIFO tests in core/tests/learn_store.rs fail
+// if a value is wrong.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const O_NOFOLLOW: i32 = 0x0100;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const O_NONBLOCK: i32 = 0x0004;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const ELOOP: i32 = 62;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const F_FULLFSYNC: i32 = 51;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const F_BARRIERFSYNC: i32 = 85;
 // Linux (x86_64) values, only so the test suite can run off the Mac (the Windows box's WSL); nothing
 // ships for Linux. The same symlink and FIFO tests check them there.
@@ -73,7 +74,7 @@ extern "C" {
 /// F_BARRIERFSYNC, else F_FULLFSYNC (§4): orders the data before the rename without waiting for the
 /// drive's cache flush on the key path (Rust's `sync_all` is F_FULLFSYNC on macOS, p99 35 ms in
 /// §11). False when both fail.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn barrier(f: &File) -> bool {
     // SAFETY: a valid open descriptor; neither command takes an argument.
     unsafe { fcntl(f.as_raw_fd(), F_BARRIERFSYNC) != -1 || fcntl(f.as_raw_fd(), F_FULLFSYNC) != -1 }
@@ -331,5 +332,48 @@ impl LearnStore {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn apple_values_are_the_header_values() {
+        assert_eq!((super::O_NOFOLLOW, super::O_NONBLOCK, super::ELOOP), (0x0100, 0x0004, 62));
+        assert_eq!((super::F_FULLFSYNC, super::F_BARRIERFSYNC), (51, 85));
+    }
+
+    /// The iOS constants are the macOS ones: both SDKs' headers define the same values. Only where Xcode has both SDKs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ios_sdk_headers_agree_with_macos() {
+        let sdk = |name: &str| {
+            let out = std::process::Command::new("xcrun").args(["--sdk", name, "--show-sdk-path"]).output().ok()?;
+            out.status.success().then(|| String::from_utf8(out.stdout).ok()).flatten().map(|s| s.trim().to_string())
+        };
+        let (Some(mac), Some(ios)) = (sdk("macosx"), sdk("iphoneos")) else {
+            eprintln!("skipped: macosx and iphoneos SDKs not both installed");
+            return;
+        };
+        let value = |root: &str, file: &str, name: &str| -> i32 {
+            let text = std::fs::read_to_string(format!("{root}/usr/include/sys/{file}")).unwrap();
+            let line = text.lines().find(|l| l.trim_start().strip_prefix("#define").is_some_and(|r| r.split_whitespace().next() == Some(name))).unwrap();
+            let v = line.split_whitespace().nth(2).unwrap();
+            match v.strip_prefix("0x") {
+                Some(h) => i32::from_str_radix(h, 16).unwrap(),
+                None => v.parse().unwrap(),
+            }
+        };
+        for (file, name, ours) in [
+            ("fcntl.h", "O_NOFOLLOW", super::O_NOFOLLOW),
+            ("fcntl.h", "O_NONBLOCK", super::O_NONBLOCK),
+            ("errno.h", "ELOOP", super::ELOOP),
+            ("fcntl.h", "F_FULLFSYNC", super::F_FULLFSYNC),
+            ("fcntl.h", "F_BARRIERFSYNC", super::F_BARRIERFSYNC),
+        ] {
+            assert_eq!(value(&mac, file, name), ours, "{name} (macosx SDK)");
+            assert_eq!(value(&ios, file, name), ours, "{name} (iphoneos SDK)");
+        }
     }
 }

@@ -492,7 +492,7 @@ fn kn_lm(side: Option<&str>) -> Lm {
 fn paired(name: &str, b: &[u8], lm: &Lm) -> Result<(), TinyLmError> {
     let p = std::env::temp_dir().join(format!("shanjie-tinylm-kn-{}-{name}.sjtl", std::process::id()));
     std::fs::write(&p, b).unwrap();
-    let r = TinyLm::load_paired(&p, lm).map(|(_, read)| assert_eq!(read, b, "the bytes it parsed"));
+    let r = TinyLm::load_paired(&p, lm).map(|(_, read)| assert_eq!(&*read, b, "the bytes it parsed"));
     std::fs::remove_file(p).unwrap();
     r
 }

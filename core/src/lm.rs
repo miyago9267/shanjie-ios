@@ -66,12 +66,22 @@ fn beside(model: &Path, name: &str) -> Result<Option<std::path::PathBuf>, ()> {
     }
 }
 
-/// `beside`, then read whole (an existing path that cannot be read is an error).
-fn read_beside(model: &Path, name: &str) -> Result<Option<Vec<u8>>, ()> {
+/// `beside`, then mapped read-only (an existing path that cannot be mapped is an error).
+fn map_beside(model: &Path, name: &str) -> Result<Option<Mapped>, ()> {
     match beside(model, name)? {
-        Some(side) => std::fs::read(side).map(Some).map_err(|_| ()),
+        // SAFETY: see `map_model_file`.
+        Some(side) => unsafe { Mapped::open(&side) }.map(Some),
         None => Ok(None),
     }
+}
+
+/// Maps a model file read-only instead of reading it onto the heap (docs/contracts/ios-keyboard.md section 2: the pages are clean
+/// file-backed pages, not phys_footprint). Everything but the trigram table is parsed into typed arrays and the mapping dropped
+/// before `load_opts` returns, so these files are only read during the call.
+fn map_model_file(path: &Path) -> Result<Mapped, ()> {
+    // SAFETY: nothing rewrites these files in place while they are mapped; the App's Resources and a user's data/lm are replaced
+    // only by rename (see `Mapped::open`).
+    unsafe { Mapped::open(path) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,20 +269,20 @@ impl Lm {
     /// `load_with` with the trigram table optional too (`--no-tri`): off, the table is not read. On, a `trigram.sjt3` that exists
     /// (a dangling symlink included) but cannot be read or does not match the model is `TriTable`; no such path is off.
     pub fn load_opts(path: &Path, classes: bool, kn: bool, tri: bool) -> Result<Lm, LmError> {
-        let model = std::fs::read(path).map_err(|_| LmError::Io)?;
+        let model = map_model_file(path).map_err(|()| LmError::Io)?;
         let mut lm = if classes {
-            let c = std::fs::read(path.with_file_name("classes.sjc")).map_err(|_| LmError::Io)?;
+            let c = map_model_file(&path.with_file_name("classes.sjc")).map_err(|()| LmError::Io)?;
             Lm::parse_with_classes(&model, &c)?
         } else {
             Lm::parse(&model)?
         };
         if kn {
-            if let Some(side) = read_beside(path, "kn.sjkn").map_err(|_| LmError::KnSide)? {
+            if let Some(side) = map_beside(path, "kn.sjkn").map_err(|_| LmError::KnSide)? {
                 lm.add_kn(&side)?;
             }
         }
         if tri {
-            // Mapped, not read: the table is 143.6 MB (docs/contracts/trigram-mmap.md). The same "exists" test as `read_beside`.
+            // Mapped, not read: the table is 143.6 MB (docs/contracts/trigram-mmap.md). The same "exists" test as `map_beside`.
             if let Some(side) = beside(path, "trigram.sjt3").map_err(|_| LmError::TriTable)? {
                 // SAFETY: nothing rewrites this file in place while an `Lm` has it mapped. The App's Resources and a user's data/lm are
                 // replaced only by rename (scripts/install-ime.sh, the installer, the Homebrew cask), and tools/build_trigram.py writes a
