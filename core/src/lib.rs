@@ -10,6 +10,7 @@ pub mod learn_store;
 pub mod lm;
 pub mod oc;
 pub mod predict;
+pub mod syllable;
 pub mod tinylm;
 mod trigram;
 
@@ -277,6 +278,10 @@ impl Lexicon {
         self.readings.partition_point(|r| r.start as usize <= p) - 1
     }
 
+    /// Every distinct syllable name in the lexicon (tone mark included), for `syllable::SylTable`.
+    pub fn syllable_names(&self) -> impl Iterator<Item = &str> {
+        self.syl_names.iter().map(String::as_str)
+    }
     pub fn reading_count(&self) -> usize {
         self.readings.len()
     }

@@ -5,6 +5,7 @@ use crate::learn::{context_key, digit_of, english_of, english_or_space, is_han, 
 use crate::learn_store::{LearnStore, Opened, StoreError, JOURNAL_MAX};
 use crate::predict::{predict, predict_digits, reading_matches_in, unit_of_syllable, Mode, Unit};
 use crate::lm::{decode_segment_learned, history, CappedLexicon, Demote, End, Learn, Lm, Profile};
+use crate::syllable::{Slots, SylTable};
 use crate::trigram::TriMemo;
 use crate::digits::DigitTable;
 mod digit_layer;
@@ -161,7 +162,7 @@ const ENGLISH_MAX_LINES: usize = 200_000;
 const ENGLISH_LEN: std::ops::RangeInclusive<usize> = 3..=32;
 
 /// Initial (21), medial (3), final (13) symbols in the contract's column order.
-const SYMBOLS: &str = "ㄅㄆㄇㄈㄉㄊㄋㄌㄍㄎㄏㄐㄑㄒㄓㄔㄕㄖㄗㄘㄙㄧㄨㄩㄚㄛㄜㄝㄞㄟㄠㄡㄢㄣㄤㄥㄦ";
+pub(crate) const SYMBOLS: &str = "ㄅㄆㄇㄈㄉㄊㄋㄌㄍㄎㄏㄐㄑㄒㄓㄔㄕㄖㄗㄘㄙㄧㄨㄩㄚㄛㄜㄝㄞㄟㄠㄡㄢㄣㄤㄥㄦ";
 const KEYS_STANDARD: &str = "1qaz2wsxedcrfv5tgbyhnujm8ik,9ol.0p;/-";
 const KEYS_ETEN: &str = "bpmfdtnlvkhg7c,./j;'sexuaorwiqzy890-=";
 /// Tone marks for tone 1..5 (tone 1 is unmarked).
@@ -500,6 +501,10 @@ pub struct Engine {
     syls: Vec<String>,
     cursor: usize,
     pend: [Option<char>; 3],
+    /// Fluent-input contract section 1: 0 strict (default), 1 an unfinished one-tone syllable ends when the next symbol cannot join it.
+    fluency: u8,
+    /// The lexicon's syllables by column, built when `fluency` first leaves 0.
+    syl_table: Option<SylTable>,
     /// V3 engine contract section 12: with the abbreviation composer on, the unfinished units before `pend` (the last one),
     /// in typing order. Never empty units; non-empty only while `pend` is.
     pend_prev: Vec<[Option<char>; 3]>,
@@ -771,6 +776,8 @@ impl Engine {
             syls: Vec::new(),
             cursor: 0,
             pend: [None; 3],
+            fluency: 0,
+            syl_table: None,
             pend_prev: Vec::new(),
             fixed: Vec::new(),
             display: String::new(),
@@ -1249,12 +1256,21 @@ impl Engine {
     /// shared constructor. Failure leaves the previous state. The composition display is not recomputed;
     /// the next change to it decodes with the new model.
     pub fn load_lm(&mut self, path: &Path) -> Result<(), EngineError> {
+        self.load_lm_with(path, true)
+    }
+
+    /// `load_lm` that never maps a `trigram.sjt3` beside the model: the iOS keyboard's setup (fluent-input contract section 1, `--ios`).
+    pub fn load_lm_without_trigram(&mut self, path: &Path) -> Result<(), EngineError> {
+        self.load_lm_with(path, false)
+    }
+
+    fn load_lm_with(&mut self, path: &Path, tri: bool) -> Result<(), EngineError> {
         self.invalidate();
         let dir = self.data_dir.as_ref().ok_or(EngineError::LoadFailed)?;
         let overlay = capping_overlay(dir, self.pack_text.as_deref().unwrap_or(""))?;
         let demote = std::fs::read_to_string(dir.join("demote.tsv")).map_err(|_| EngineError::LoadFailed)?;
         let demote = Demote::parse(&demote).ok_or(EngineError::LoadFailed)?;
-        let lm = Lm::load(path).map_err(|_| EngineError::LoadFailed)?;
+        let lm = Lm::load_opts(path, true, true, tri).map_err(|_| EngineError::LoadFailed)?;
         let capped = CappedLexicon::new(self.lex.clone(), &overlay, &lm, Some(&demote)).ok_or(EngineError::LoadFailed)?;
         // Built now, not at the first key: the index takes hundreds of ms (V3 engine contract section 1.2).
         capped.predict_index(&lm);
@@ -1340,6 +1356,46 @@ impl Engine {
     pub fn set_candidate_vertical(&mut self, on: bool) -> Result<Output, EngineError> {
         self.cand_vertical = on;
         self.handled()
+    }
+
+    /// Highest `fluency` level this build has (fluent-input contract section 1): the C ABI rejects a higher one.
+    pub const MAX_FLUENCY: u8 = 1;
+
+    /// Fluent-input contract section 1: 0 strict (default, today's rules bit for bit), 1 an unfinished syllable that is a one-tone
+    /// syllable ends when the next symbol cannot join it (section 2). A level above `MAX_FLUENCY` changes nothing and returns `None`.
+    /// Otherwise the snapshot, like `set_prediction`.
+    pub fn set_fluency(&mut self, level: u8) -> Option<Output> {
+        if level > Self::MAX_FLUENCY {
+            return None;
+        }
+        if level >= 1 && self.syl_table.is_none() {
+            self.syl_table = Some(SylTable::new(self.lex.syllable_names()));
+        }
+        self.fluency = level;
+        self.handled().ok()
+    }
+
+    pub fn fluency(&self) -> u8 {
+        self.fluency
+    }
+
+    /// The units of the composition in order, then the unfinished syllable's symbols if any (each unit without spaces; the tone
+    /// mark stays on a finished syllable). For the replay tool's `--readings` and the tests.
+    #[doc(hidden)]
+    pub fn readings(&self) -> Vec<String> {
+        let tail = self.pending();
+        self.syls.iter().cloned().chain((!tail.is_empty()).then_some(tail)).collect()
+    }
+
+    /// The symbols of the unfinished syllable (empty when there is none), for the tests.
+    #[doc(hidden)]
+    pub fn unfinished(&self) -> String {
+        self.pending()
+    }
+
+    /// Drops the digit table    /// Drops the digit table `new` read from `digits.tsv`, as a bundle without that file would have it (the iOS keyboard's setup).
+    pub fn clear_digit_table(&mut self) {
+        self.digit_table = None;
     }
 
     /// Whether a symbol typed into an occupied column opens a new unfinished unit (default off, V3 engine contract section 12).
@@ -1609,6 +1665,25 @@ impl Engine {
         }
         let (words, word) = self.eligible_shadow()?;
         (Self::is_word(words, &word) && !Self::has_prefix(words, &format!("{word}{ch}"))).then_some(word)
+    }
+
+    /// Fluent-input contract section 2 (`fluency` >= 1): the unfinished symbols have no tone and the symbol `sym` for column `col`
+    /// arrives. False when it joins them (its column is free and the result can still become a syllable); otherwise true when the
+    /// symbols already are a one-tone syllable, so they end as one and `sym` starts the next. False when they are not: the symbol
+    /// replaces (occupied column) or is put in, as in strict typing. The lexicon's lone initials other than ㄓㄔㄕㄖㄗㄘㄙ are not
+    /// syllables (they are symbol entries), so a lone ㄅ then ㄉ stays a replacement.
+    fn ends_one_tone_syllable(&self, col: usize, sym: char) -> bool {
+        let Some(table) = &self.syl_table else { return false };
+        if self.pend[col].is_none() {
+            let mut joined: Slots = self.pend;
+            joined[col] = Some(sym);
+            if table.extends(&joined) {
+                return false;
+            }
+        }
+        let p = self.pending();
+        let lone_initial = self.pend.iter().flatten().count() == 1 && self.pend[0].is_some_and(|c| !"ㄓㄔㄕㄖㄗㄘㄙ".contains(c));
+        !lone_initial && !self.lex.entries(&[p]).is_empty()
     }
 
     /// The first key of a new syllable after an auto-keep or a kept window: rule 14.
@@ -2471,6 +2546,12 @@ impl Engine {
                 // Zhen-inline section 1.3: letters on screen that are a whole word, and a key that cannot go on: keep the word.
                 if let Some(word) = self.autokeep_word(k.ch) {
                     let commit = self.insert_english(word, true)?;
+                    self.start_syllable(k.ch, col, sym);
+                    return Ok(self.view(true, commit));
+                }
+                // Fluent-input section 2: a one-tone syllable the next symbol cannot join ends here (spaceless typing).
+                if self.fluency >= 1 && self.pend_prev.is_empty() && self.ends_one_tone_syllable(col, sym) {
+                    let commit = self.finish_syllable(0, old)?.commit;
                     self.start_syllable(k.ch, col, sym);
                     return Ok(self.view(true, commit));
                 }

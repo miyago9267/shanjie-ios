@@ -525,6 +525,45 @@ pub unsafe extern "C" fn shanjie_engine_set_demote(
     rc
 }
 
+/// Fluent-input contract section 1. `level` 0 (default, strict) or 1 (an unfinished one-tone syllable ends when the next symbol
+/// cannot join it); higher levels are not built yet: 2, 3 and anything above return 2 and change nothing. Returns the snapshot
+/// like `set_prediction`.
+///
+/// # Safety
+/// `engine` is NULL or a live handle; `out` is NULL or valid for one pointer write.
+#[no_mangle]
+pub unsafe extern "C" fn shanjie_engine_set_fluency(
+    engine: *mut ShanjieEngine,
+    level: u32,
+    out: *mut *mut ShanjieOutput,
+) -> i32 {
+    let rc = guard(|| {
+        // SAFETY: forwarded caller contract.
+        if !unsafe { clear_out(out) } || engine.is_null() {
+            return SHANJIE_ERR_NULL;
+        }
+        if level > u32::from(Engine::MAX_FLUENCY) {
+            return SHANJIE_ERR_INVALID;
+        }
+        // SAFETY: live handle, single-threaded use (§6).
+        let e = unsafe { &mut (*engine).0 };
+        match e.set_fluency(level as u8) {
+            Some(o) => {
+                #[cfg(test)]
+                tests::inject(&o);
+                // SAFETY: `out` checked non-NULL above.
+                unsafe { emit(o, out) }
+            }
+            None => SHANJIE_ERR_INVALID,
+        }
+    });
+    if rc == SHANJIE_ERR_INTERNAL {
+        // SAFETY: forwarded caller contract.
+        unsafe { discard(engine) };
+    }
+    rc
+}
+
 /// V3 engine contract section 10.5. `enabled` 0 or 1 (default 1): whether the prediction row is computed. Returns the
 /// snapshot like `set_demote`; any other value changes nothing and returns 2.
 ///
@@ -1328,6 +1367,22 @@ mod tests {
             assert!(unsafe { shanjie_engine_set_prediction(e, v, &mut o) } == 0 && !o.is_null(), "set_prediction 0/1");
             unsafe { shanjie_output_free(o) };
         }
+
+        // engine_set_fluency (fluent-input contract section 1): 0 and 1 only until the later levels land.
+        o = sentinel();
+        assert!(unsafe { shanjie_engine_set_fluency(e, 1, ptr::null_mut()) } == 1, "set_fluency out NULL");
+        assert!(unsafe { shanjie_engine_set_fluency(ptr::null_mut(), 1, &mut o) } == 1 && o.is_null(), "set_fluency engine NULL");
+        for v in [2, 3, 4, u32::MAX] {
+            o = sentinel();
+            assert!(unsafe { shanjie_engine_set_fluency(e, v, &mut o) } == 2 && o.is_null(), "set_fluency 2, 3 and above are rejected");
+        }
+        for v in [0, 1] {
+            o = sentinel();
+            assert!(unsafe { shanjie_engine_set_fluency(e, v, &mut o) } == 0 && !o.is_null(), "set_fluency 0/1");
+            unsafe { shanjie_output_free(o) };
+        }
+        assert!(unsafe { shanjie_engine_set_fluency(e, 0, &mut o) } == 0);
+        unsafe { shanjie_output_free(o) };
 
         // engine_set_abbreviation (V3 engine contract section 12.1): codes like set_prediction.
         o = sentinel();

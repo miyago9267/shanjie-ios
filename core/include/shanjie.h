@@ -135,6 +135,13 @@ int32_t shanjie_engine_set_demote(ShanjieEngine *engine, uint32_t enabled, Shanj
 //   0 clears the prediction row (an entered row is left) and computes none; 1 recomputes it, so a row that
 //   fits the display conditions shows in the returned snapshot. No effect without a loaded model.
 int32_t shanjie_engine_set_prediction(ShanjieEngine *engine, uint32_t enabled, ShanjieOutput **out); // 0 or 1; returns a snapshot
+// fluent-input (docs/contracts/fluent-input.md sections 1 and 2): set_fluency 0 or 1 (2 otherwise, state unchanged; levels 2 and 3 are
+//   not built yet and return 2 too), default 0, like set_prediction in its codes and its snapshot (handled 1, commit ""); 1 when
+//   engine or out is NULL. 0 is strict typing, bit for bit as before. 1 keeps symbol order free as today and, when the unfinished
+//   syllable has no tone and is itself a one-tone syllable, ends it (first tone) as soon as the next symbol cannot join it (its
+//   column is taken, or nothing can extend), then starts the next syllable with that symbol: ㄊㄚ ㄇㄣ˙ without the space. Typing
+//   with a space or tone key after every syllable behaves the same at both levels. Call it after every engine creation.
+int32_t shanjie_engine_set_fluency(ShanjieEngine *engine, uint32_t level, ShanjieOutput **out); // 0 or 1; returns a snapshot
 // candidate-vertical (docs/contracts/candidate-vertical.md section 2.2): set_candidate_vertical 0 or 1 (2 otherwise, state
 //   unchanged), default 0, like set_prediction in its codes and its snapshot (handled 1, commit ""); 1 when engine or out is
 //   NULL. It sets the orientation of the candidate windows that open from now on (the Space/Down that opens the window,
