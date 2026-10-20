@@ -7913,3 +7913,36 @@ XL 比 `MAX_FILE`（67,108,864）小 1,168,880 位元組。錨點：4 個模型 
   - plan-verifier 兩次 REVISE，八項都照最小修改處理。重點是 dry run 的版本是 0.0.0、虛擬機不能打字、實機步驟的順序。
   - 收尾審查 READY。
 - **下一步**：security-executor 實作，接著是 `/code-review`、fresh verifier、CI。合併之後依序做實機（開發版 ID 的更新測試）、dry run、虛擬機、實機（正式 ID），之後才發 v0.5.0。舊的 PR #94 在新 PR 開出時關掉。
+
+## 2026-10-21：流暢輸入第 1 片（`fluency` 1）：量到的數字
+
+契約 `docs/contracts/fluent-input.md` §2；實作與共用工具（§1）：`--ios`、`--fluency`、`--feed full|perm|omit1|tones|toneless`、`--seed`、`--readings`，另加 `--timing`（每鍵 p95 與最大值，印在 stderr）。全部用 `--ios`（不載三元表、詞包、tinylm，不重排，不放 `digits.tsv`）量，release 組建，Mac；每項取三輪的中位數，機器不是完全閒置（1 分鐘負載約 5，時間欄僅供參考）。
+
+- **`--ios` 驗收**：stderr 的 `models:` 行沒有 `trigram.sjt3`、tinylm 為 `none`；標籤含 `+ios`、不含 `+acg`；沒給 `--ios` 的 dev302 聊天與書面，stdout 與 stderr 跟改動前的組建逐位元相同（`cmp`）。
+- **驗收 1（鎖住既有行為）**：`core/tests/engine_fluency.rs`，1,399 個帶調音節（1,413 減 14 個假單聲母）、符號鍵所有排列加聲調鍵（或空白）在最後，`fluency` 0 與 1 都得到同一個音節：100%。
+- **驗收 2（乾淨輸入不變，`--feed full`）**：六組的 `fluency` 1 與 0 的 `top1_sha256` 逐位元相同。
+
+  | 集合 | 設定 | top-1 | `top1_sha256`（`fluency` 0 與 1 相同） |
+  |---|---|---|---|
+  | dev302 | 聊天 | 246 | d8ac58795e5649a557bcd62e7639cee2a9bbdbbe13860f13794ff95092ce5be8 |
+  | dev302 | 書面 | 249 | 3cd198d63b2efa6696ecf7fae1d3f6a1fb063f3c1b7b6cc32c86606685eb3292 |
+  | typing76 | 聊天 | 70 | 192b2bf3c1d59ba9a35586cf21292ffee7c54590dba16ef0e246a45557bb292c |
+  | typing76 | 書面 | 69 | 2daa33f7c4446ab23f79a86534506f66da9629ac7b316f15e1a77e02d2b5e19f |
+  | user-reported（135 列） | 聊天 | 29 | 9c00c59137cc09e186ee6328587451e191bee18f8659396bac19b9697f25a7bb |
+  | user-reported（135 列） | 書面 | 38 | 2144a5266d869e9210611d0e6bd8cb65d3af7b2103aa346747fcce0bceb9fb01 |
+
+- **驗收 3（`omit1`，dev302）**：斷開處共 470 處（dev302 加 typing76 是 139 處，合計 609，與契約 §0 的數字一致）。
+
+  | 設定 | `fluency` | top-1 | 對 `full` 的比 | 按鍵總數（不含改選） | 斷開處正確率 |
+  |---|---|---|---|---|---|
+  | 聊天 | 0 | 51 | 0.21 | 7,866 | 195／470＝41.5% |
+  | 聊天 | 1 | 219 | 0.890（219／246） | 7,866 | 432／470＝91.9% |
+  | 書面 | 0 | 51 | 0.20 | 7,866 | 195／470＝41.5% |
+  | 書面 | 1 | 222 | 0.892（222／249） | 7,866 | 432／470＝91.9% |
+
+  `full` 的按鍵總數是 8,336（兩種設定同），`omit1` 省 470 個空白鍵。通過：正確率 ≥ 90%、top-1 ≥ 0.75 倍。補充：typing76 聊天 130／139（93.5%），user-reported 聊天 131／145（90.3%）。`--feed perm`（種子 7、8）在 `fluency` 0 與 1 的 top-1 都是 246、`top1_sha256` 與 `full` 相同（同一個音節的符號換順序不產生欄位衝突）；種子 7 跑兩次的 `--keys` 檔逐位元相同。
+- **驗收 4（延遲與記憶體）**：dev302 重播的每鍵 p95，`fluency` 0 `full` 1.401–1.424 ms（聊天，三輪）、`fluency` 1 `full` 1.402–1.421 ms、`fluency` 1 `omit1` 1.400–1.408 ms；上限是基準＋0.3 ms，中位數差 ＋0.005 ms。書面 1.412–1.437／1.409–1.429／1.407–1.447 ms。單鍵最大 8.2–9.5 ms（上限 30 ms）。載入時間（`--dev 1` 的牆鐘）`fluency` 0 1.42–1.49 s、`fluency` 1 1.42–1.46 s。
+- **記憶體（有一項沒對上，已查來源）**：`/usr/bin/time -l` 的 peak memory footprint，`--ios --dev 302`：`fluency` 0 為 203.3／204.1／203.4 MiB，`fluency` 1 為 204.9／203.9／203.7 MiB（相對基準 ＋0.5 MiB，在雜訊裡）。但契約 §1 的替身檢查要求與 115–116 MB 相差 ≤ 5 MB，這裡差了約 88 MiB。查來源：臨時探針（讀 `phys_footprint`，不進 repo）量到載入完成後是 119.3 MiB（`Engine::new` 之後 74.3、`load_lm` 之後 119.3），與 115–116 相符（差 3–4）；`set_fluency(1)` 之後仍是 119.3，增量小於 0.1 MiB。所以 `/usr/bin/time -l` 的 peak 抓到的是**載入過程的暫時尖峰**（約 201 MiB，`--dev 1` 就有），不是常駐值，這個替身量到的是另一個東西。上限用「載入後的 `phys_footprint`」比對基準（＋0 通過），尖峰本身不在契約的上限表裡；它大於 jetsam 約 177 MiB 這件事留給維護者決定要不要另查（裝置上的尖峰沒量過）。
+- **存活性**：`core/tests/engine_fluency.rs` 的 `liveness_100k_random_sequences_per_level`，固定種子、每級 10⁵ 個隨機鍵序（37 個符號鍵、4 個聲調鍵、Space、Enter、Backspace、Esc、方向鍵、Home、End、Delete、Tab、PageUp、PageDown；每個鍵序 1–24 鍵，逐鍵檢查快照自洽與沒有卡鍵，序尾 Esc 兩次或 Backspace 到空必清空）；`fluency` 0 與 1 都過，另用 iOS 設定（載入語言模型，`SHANJIE_LIVENESS_LM=1`）各跑 10⁵ 也過。契約列的四條例外各有單元測試；除此之外跑出兩類契約沒列的「已處理但狀態沒變」：（a）注音鍵打在已有同一個符號的欄位上（取代成自己；`fluency` 1 時只有未完成符號不是一聲音節才會發生），（b）邊界上無處可動的鍵（游標在頭尾的 Left／Home／Backspace／Right／End／Delete、↑／Tab 沒有窗、候選窗內到頭的鍵與超出候選數的數字）。兩類測試裡以 `same`、`edge` 標出，寫進契約的例外要維護者決定。另外，PageUp／PageDown 在有未完成音節時是**不處理（直通）**，不是「處理但不動作」。
+- 工程上的決定：引擎的「一聲音節」判斷排除詞庫裡 14 個假單聲母（只有 ㄓㄔㄕㄖㄗㄘㄙ 是真的單聲母音節），否則先打 ㄅ 再打 ㄉ（改打）會把 ㄅ 當一聲音節完成。契約 §2 寫「`lex.entries(&[P])` 非空」，沒有這個排除，補進契約。
+
