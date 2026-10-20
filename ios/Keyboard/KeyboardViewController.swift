@@ -32,6 +32,47 @@ private final class FitRow: UIView {
     func relayout() { setNeedsLayout() }
 }
 
+/// Layout constants for the keyboard; one place for a later settings slice.
+enum KeyMetrics {
+    static var keyHeight: CGFloat = 48
+    static var rowSpacing: CGFloat = 8
+    static var keySpacing: CGFloat = 6
+    static var cornerRadius: CGFloat = 9
+    static var labelSize: CGFloat = 24
+    static var sideInset: CGFloat = 3
+}
+
+private final class Key: UIButton {
+    var glyph = ""
+}
+
+/// Places keys left to right in `units` of one key width (spacing included between keys).
+/// `inset` is in key units; hidden keys are skipped; the flexible key takes the remaining units.
+private final class KeyRow: UIView {
+    var items: [(view: UIView, units: CGFloat)] = []
+    var flexible: UIView?
+    var inset: CGFloat = 0
+    var total: CGFloat = 11
+
+    func add(_ v: UIView, units: CGFloat = 1) { items.append((v, units)); addSubview(v) }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let gap = KeyMetrics.keySpacing
+        let u = (bounds.width - gap * (total - 1)) / total   // width of one key unit
+        let shown = items.filter { !$0.view.isHidden }
+        let fixed = shown.filter { $0.view !== flexible }.reduce(0) { $0 + $1.units }
+        let flexUnits = max(total - inset - fixed, 1)
+        var x = inset * (u + gap)
+        for it in shown {
+            let n = it.view === flexible ? flexUnits : it.units
+            let w = n * u + (n - 1) * gap
+            it.view.frame = CGRect(x: x, y: 0, width: w, height: bounds.height)
+            x += w + gap
+        }
+    }
+}
+
 /// One reusable pop-up showing the enlarged glyph of the held key.
 private final class Callout: UILabel {
     override init(frame: CGRect) {
@@ -69,6 +110,12 @@ final class KeyboardViewController: UIInputViewController {
     private let haptic = UIImpactFeedbackGenerator(style: .light)
     private let chevron = UIButton(type: .system)
     private lazy var globe = key("")
+    private lazy var symbols = key("123")
+    private lazy var modeKey = key("")
+    private lazy var space = key("")
+    private lazy var enter = key("↵")
+    private let spaceHint = UILabel()
+    private var bottomRow: KeyRow?
     private var display = Display()
     private var deleteTimer: Timer?
 
@@ -198,20 +245,23 @@ final class KeyboardViewController: UIInputViewController {
 
     override func viewWillLayoutSubviews() {
         super.viewWillLayoutSubviews()
-        globe.isHidden = !needsInputModeSwitchKey
+        if globe.isHidden == needsInputModeSwitchKey {
+            globe.isHidden = !needsInputModeSwitchKey
+            bottomRow?.setNeedsLayout()
+        }
     }
 
     private func buildUI() {
         let root = UIStackView()
         root.axis = .vertical
-        root.spacing = 5
+        root.spacing = KeyMetrics.rowSpacing
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 3),
-            root.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -3),
+            root.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: KeyMetrics.sideInset),
+            root.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -KeyMetrics.sideInset),
             root.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
-            root.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -2),
+            root.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -4),
         ])
 
         chevron.titleLabel?.font = .systemFont(ofSize: 20)
@@ -221,51 +271,89 @@ final class KeyboardViewController: UIInputViewController {
         bar.heightAnchor.constraint(equalToConstant: 40).isActive = true
         root.addArrangedSubview(bar)
 
-        for row in Self.rows {
-            let s = UIStackView()
-            s.distribution = .fillEqually
-            s.spacing = 4
+        let insets: [CGFloat] = [0, 0.5, 1, 0]
+        for (r, row) in Self.rows.enumerated() {
+            let s = KeyRow()
+            s.inset = insets[r]
+            s.total = r == 1 ? 10 + 1 : 11
             for (label, ascii) in row {
                 let b = key(label)
                 b.tag = Int(ascii.unicodeScalars.first!.value)
                 b.addTarget(self, action: #selector(zhuyinTapped(_:)), for: .touchDown)
                 b.addTarget(self, action: #selector(showCallout(_:)), for: .touchDown)
-                s.addArrangedSubview(b)
+                s.add(b)
             }
-            s.heightAnchor.constraint(equalToConstant: 42).isActive = true
+            if r == 3 {
+                let back = key("⌫")
+                back.addTarget(self, action: #selector(backDown), for: .touchDown)
+                back.addTarget(self, action: #selector(backUp), for: [.touchUpInside, .touchUpOutside, .touchCancel])
+                back.addTarget(self, action: #selector(feedback), for: .touchDown)
+                s.add(back)
+            }
+            s.heightAnchor.constraint(equalToConstant: KeyMetrics.keyHeight).isActive = true
             root.addArrangedSubview(s)
         }
 
         globe.setImage(UIImage(systemName: "globe"), for: .normal)
-        globe.tintColor = .label
         globe.addTarget(self, action: #selector(handleInputModeList(from:with:)), for: .allTouchEvents)
-        let space = key("空白")
+        symbols.addTarget(self, action: #selector(symbolsTapped), for: .touchDown)
+        modeKey.addTarget(self, action: #selector(modeTapped), for: .touchDown)
         space.addTarget(self, action: #selector(spaceTapped), for: .touchDown)
-        let back = key("⌫")
-        back.addTarget(self, action: #selector(backDown), for: .touchDown)
-        back.addTarget(self, action: #selector(backUp), for: [.touchUpInside, .touchUpOutside, .touchCancel])
-        let enter = key("換行")
         enter.addTarget(self, action: #selector(enterTapped), for: .touchDown)
-        for v in [globe, space, back, enter] { v.addTarget(self, action: #selector(feedback), for: .touchDown) }
-        let bottom = UIStackView(arrangedSubviews: [globe, space, back, enter])
-        bottom.spacing = 4
-        bottom.distribution = .fill
-        globe.widthAnchor.constraint(equalToConstant: 56).isActive = true
-        back.widthAnchor.constraint(equalToConstant: 64).isActive = true
-        enter.widthAnchor.constraint(equalToConstant: 72).isActive = true
-        bottom.heightAnchor.constraint(equalToConstant: 42).isActive = true
+        for v in [globe, symbols, modeKey, space, enter] { v.addTarget(self, action: #selector(feedback), for: .touchDown) }
+
+        spaceHint.font = .systemFont(ofSize: 12)
+        spaceHint.textColor = .secondaryLabel
+        spaceHint.text = mode.hint
+        spaceHint.translatesAutoresizingMaskIntoConstraints = false
+        space.addSubview(spaceHint)
+        NSLayoutConstraint.activate([
+            spaceHint.trailingAnchor.constraint(equalTo: space.trailingAnchor, constant: -8),
+            spaceHint.bottomAnchor.constraint(equalTo: space.bottomAnchor, constant: -4),
+        ])
+        modeKey.setImage(UIImage(systemName: "character.bubble"), for: .normal)
+
+        let bottom = KeyRow()
+        bottom.add(symbols, units: 1.5)
+        bottom.add(modeKey, units: 1.5)
+        bottom.add(globe, units: 1.5)
+        bottom.add(space)
+        bottom.add(enter, units: 2.5)
+        bottom.flexible = space
+        bottom.heightAnchor.constraint(equalToConstant: KeyMetrics.keyHeight).isActive = true
+        self.bottomRow = bottom
         root.addArrangedSubview(bottom)
         view.addSubview(callout)
     }
+
+    private enum InputMode: CaseIterable {
+        case zhuyin, english
+        var name: String { self == .zhuyin ? "注音" : "英文" }
+        var hint: String { self == .zhuyin ? "注" : "英" }
+    }
+    private var mode = InputMode.zhuyin
+    private var hintReset: DispatchWorkItem?
+
+    // Placeholder: UI state only, the engine is not told.
+    @objc private func modeTapped() {
+        let all = InputMode.allCases
+        mode = all[(all.firstIndex(of: mode)! + 1) % all.count]
+        spaceHint.text = mode.name
+        hintReset?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.spaceHint.text = self?.mode.hint }
+        hintReset = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: w)
+    }
+
+    @objc private func symbolsTapped() {}
 
     @objc private func feedback() {
         UIDevice.current.playInputClick()
         if hasFullAccess { haptic.impactOccurred(); haptic.prepare() }
     }
 
-    @objc private func showCallout(_ b: UIButton) {
-        guard let title = b.title(for: .normal) else { return }
-        callout.text = title
+    @objc private func showCallout(_ b: Key) {
+        callout.text = b.glyph
         let f = b.convert(b.bounds, to: view)
         let w = f.width + 16, h: CGFloat = 56
         callout.frame = CGRect(x: min(max(f.midX - w / 2, 0), view.bounds.width - w), y: max(f.minY - h - 4, 0), width: w, height: h)
@@ -274,13 +362,23 @@ final class KeyboardViewController: UIInputViewController {
 
     @objc private func hideCallout() { callout.isHidden = true }
 
-    private func key(_ title: String) -> UIButton {
-        let b = UIButton(type: .system)
-        b.setTitle(title, for: .normal)
-        b.titleLabel?.font = .systemFont(ofSize: 22)
-        b.setTitleColor(.label, for: .normal)
-        b.backgroundColor = Self.keyBg
-        b.layer.cornerRadius = 6
+    private var glass: Bool { if #available(iOS 26, *) { return true } else { return false } }
+
+    private func key(_ title: String) -> Key {
+        let b = Key()
+        b.glyph = title
+        var cfg: UIButton.Configuration
+        if #available(iOS 26, *) { cfg = .glass() } else { cfg = .plain(); b.backgroundColor = Self.keyBg }
+        cfg.cornerStyle = .fixed
+        cfg.background.cornerRadius = KeyMetrics.cornerRadius
+        cfg.contentInsets = .zero
+        cfg.baseForegroundColor = .label
+        cfg.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: KeyMetrics.labelSize - 4)
+        cfg.attributedTitle = AttributedString(title, attributes: AttributeContainer([
+            .font: UIFont.systemFont(ofSize: KeyMetrics.labelSize)]))
+        b.configuration = cfg
+        b.layer.cornerCurve = .continuous
+        b.layer.cornerRadius = KeyMetrics.cornerRadius
         b.addTarget(self, action: #selector(pressDown(_:)), for: .touchDown)
         b.addTarget(self, action: #selector(pressUp(_:)), for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
         return b
@@ -289,8 +387,8 @@ final class KeyboardViewController: UIInputViewController {
     private static let keyBg = UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.36, alpha: 1) : .white }
     private static let keyBgPressed = UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.55, alpha: 1) : UIColor(white: 0.78, alpha: 1) }
 
-    @objc private func pressDown(_ b: UIButton) { b.backgroundColor = Self.keyBgPressed }
-    @objc private func pressUp(_ b: UIButton) { b.backgroundColor = Self.keyBg; hideCallout() }
+    @objc private func pressDown(_ b: UIButton) { if !glass { b.backgroundColor = Self.keyBgPressed } }
+    @objc private func pressUp(_ b: UIButton) { if !glass { b.backgroundColor = Self.keyBg }; hideCallout() }
 
     @objc private func zhuyinTapped(_ b: UIButton) { feedback(); send(.zhuyin(UInt32(b.tag))) }
     @objc private func spaceTapped() { send(.space) }
