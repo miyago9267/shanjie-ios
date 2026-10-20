@@ -3,8 +3,11 @@
 //!
 //! shanjie-replay (--rows FILE | --dev N) [--profile chat|formal] [--no-tinylm] [--learn off|on] [--rerank each|final]
 //!                [--correct] [--rowstats FILE] [--keys FILE] [--firsts FILE]
+//!                [--ios] [--fluency N] [--feed full|perm|omit1|tones|toneless] [--seed S] [--readings FILE] [--timing]
+//! (docs/contracts/fluent-input.md section 1: `--ios` builds the engine as the iOS keyboard does; `--readings` also prints the
+//! boundary count of section 2 on stderr; `--timing` prints the per-key p95 and max on stderr.)
 use cli::common::{dev_rows, format_rowstats, load_lenient, read_rows, root};
-use cli::replay::{build_engine, format_keys, replay_row, summary_line, Cfg, Rerank, RowIn};
+use cli::replay::{boundary_stats, build_engine, build_engine_ios, format_keys, format_readings, key_latency_ms, replay_row_feed, summary_line, Cfg, Feed, Rerank, RowIn};
 use core::eval::sha256_hex;
 use core::lm::Profile;
 use std::fs;
@@ -18,6 +21,8 @@ fn run() -> Result<(), String> {
     let (mut rows_file, mut dev, mut profile_name) = (None::<String>, None::<usize>, "chat".to_string());
     let (mut tl, mut learn, mut cfg) = (true, false, Cfg { correct: false, rerank: Rerank::Each });
     let (mut rowstats, mut keys, mut firsts) = (None::<String>, None::<String>, None::<String>);
+    let (mut ios, mut fluency, mut feed, mut seed) = (false, 0u32, Feed::Full, None::<u64>);
+    let (mut readings, mut timing) = (None::<String>, false);
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or_else(|| "missing option value".to_string());
@@ -44,6 +49,12 @@ fn run() -> Result<(), String> {
             "--rowstats" => rowstats = Some(val()?),
             "--keys" => keys = Some(val()?),
             "--firsts" => firsts = Some(val()?),
+            "--ios" => ios = true,
+            "--fluency" => fluency = val()?.parse().map_err(|_| "bad number for --fluency")?,
+            "--feed" => feed = Feed::parse(&val()?).ok_or("--feed must be full, perm, omit1, tones or toneless")?,
+            "--seed" => seed = Some(val()?.parse().map_err(|_| "bad number for --seed")?),
+            "--readings" => readings = Some(val()?),
+            "--timing" => timing = true,
             _ => return Err("unknown argument".into()),
         }
     }
@@ -56,7 +67,7 @@ fn run() -> Result<(), String> {
     let len = load_lenient()?;
     // An output that is the rows file would be emptied before the rows are read: refuse, comparing the files themselves.
     if let Some(rows) = rows_file.as_deref().and_then(|f| fs::canonicalize(f).ok()) {
-        for (opt, f) in [("--rowstats", &rowstats), ("--keys", &keys), ("--firsts", &firsts)] {
+        for (opt, f) in [("--rowstats", &rowstats), ("--keys", &keys), ("--firsts", &firsts), ("--readings", &readings)] {
             if f.as_deref().and_then(|f| fs::canonicalize(f).ok()) == Some(rows.clone()) {
                 eprintln!("error: {opt} is the same file as --rows");
                 std::process::exit(2);
@@ -74,7 +85,7 @@ fn run() -> Result<(), String> {
     .collect();
     // Opened after the rows are read, like the CLI's outputs are not touched by a failed start.
     let create = |f: Option<String>| f.map(|f| fs::File::create(f).map_err(|e| format!("cannot create output file ({:?})", e.kind()))).transpose();
-    let (rowstats, keys, firsts) = (create(rowstats)?, create(keys)?, create(firsts)?);
+    let (rowstats, keys, firsts, readings) = (create(rowstats)?, create(keys)?, create(firsts)?, create(readings)?);
     let name = match (&rows_file, dev) {
         (Some(f), _) => Path::new(f).file_name().map_or(String::new(), |s| s.to_string_lossy().into_owned()),
         (_, n) => format!("dev{}", n.unwrap_or(0)),
@@ -82,24 +93,46 @@ fn run() -> Result<(), String> {
     let (lm_path, tl_path) = (root.join("data/lm/bigram.sjlm"), root.join("data/lm/tinylm.sjtl"));
     // The model hashes make the result traceable to its files: all on stderr, the two that decide the choice in the summary tag.
     let lm8 = sha8(&lm_path)?;
+    let tl = tl && !ios; // the iOS keyboard has no small model
     let tl8 = if tl { Some(sha8(&tl_path)?) } else { None };
+    // `--ios` never reads the trigram table, so its hash is not listed either.
     let others: Vec<String> = ["classes.sjc", "kn.sjkn", "trigram.sjt3"]
         .iter()
+        .filter(|f| !(ios && **f == "trigram.sjt3"))
         .filter(|f| lm_path.with_file_name(f).is_file())
         .map(|f| Ok(format!("{f}:{}", sha8(&lm_path.with_file_name(f))?)))
         .collect::<Result<_, String>>()?;
     eprintln!("models: bigram.sjlm:{lm8} {} tinylm.sjtl:{}", others.join(" "), tl8.as_deref().unwrap_or("none"));
     let tag = format!(
-        "replay-{profile_name}+ctx+acg+nopred+noen+lm:{lm8}{}{}{}{}",
-        tl8.as_ref().map_or("-notinylm".to_string(), |h| format!("+tl:{h}")),
+        "replay-{profile_name}+ctx{}+nopred+noen+lm:{lm8}{}{}{}{}{}{}{}",
+        if ios { "+ios" } else { "+acg" },
+        if ios { String::new() } else { tl8.as_ref().map_or("-notinylm".to_string(), |h| format!("+tl:{h}")) },
+        if fluency > 0 { format!("+fluency:{fluency}") } else { String::new() },
+        if feed != Feed::Full { format!("+feed:{feed:?}").to_lowercase() } else { String::new() },
+        seed.map_or(String::new(), |s| format!("+seed:{s}")),
         if learn { "+learn" } else { "" },
         if cfg.rerank == Rerank::Final { "+rerank:final" } else { "" },
         if cfg.correct { "+correct" } else { "" },
     );
-    let mut e = build_engine(&root, &lm_path, tl.then_some(tl_path.as_path()), profile, learn)?;
+    let mut e = if ios {
+        build_engine_ios(&root, &lm_path, profile, learn)?
+    } else {
+        build_engine(&root, &lm_path, tl.then_some(tl_path.as_path()), profile, learn)?
+    };
+    // A level this build does not have is an error, not a silent fallback to strict typing.
+    if fluency > 0 && u8::try_from(fluency).ok().and_then(|l| e.set_fluency(l)).is_none() {
+        return Err("--fluency is not available at that level".into());
+    }
+    let seed = seed.unwrap_or(0);
     let mut outs = Vec::with_capacity(rows.len());
     for (i, r) in rows.iter().enumerate() {
-        outs.push(replay_row(&mut e, &r.ctx, &r.syls, &r.sent, &len, cfg).map_err(|m| format!("row {}: {m}", i + 1))?);
+        // One stream per row, so a row's keys do not depend on the rows before it.
+        let row_seed = seed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        outs.push(replay_row_feed(&mut e, &r.ctx, &r.syls, &r.sent, &len, cfg, feed, row_seed).map_err(|m| format!("row {}: {m}", i + 1))?);
+    }
+    if timing {
+        let (p95, max) = key_latency_ms(&outs).ok_or("no typing key")?;
+        eprintln!("keys: p95 {p95:.3} ms max {max:.3} ms");
     }
     let write = |f: Option<fs::File>, text: String| -> Result<(), String> {
         use std::io::Write;
@@ -108,6 +141,11 @@ fn run() -> Result<(), String> {
     write(rowstats, format_rowstats(&outs.iter().zip(&rows).map(|(o, r)| (o.first_ok, o.first.clone(), r.sent.clone())).collect::<Vec<_>>()))?;
     write(keys, format_keys(&outs))?;
     write(firsts, outs.iter().map(|o| format!("{}\n", o.first)).collect())?;
+    if readings.is_some() {
+        let (total, found) = boundary_stats(&rows, &outs);
+        eprintln!("boundaries: {found}/{total} ({:.1}%)", 100.0 * found as f64 / total.max(1) as f64);
+    }
+    write(readings, format_readings(&outs))?;
     let gold_chars = rows.iter().map(|r| r.sent.chars().count()).sum();
     println!("{}", summary_line(&name, &tag, &outs, gold_chars));
     Ok(())

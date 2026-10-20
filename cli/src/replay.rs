@@ -3,9 +3,11 @@
 use core::engine::{Engine, Key, KeyKind, Layout, Output, PACK_ACG, PAGE_SIZE};
 use core::eval::{pyround, sha256_hex, Lenient};
 use core::lm::Profile;
+use core::syllable::slot_of;
 use core::tinylm::RerankLevel;
 use core::Syls;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// When the small model's work is applied (contract section 3).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -40,6 +42,52 @@ pub struct RowOut {
     pub rewrites: usize,
     /// `apply_rerank` calls that returned `Some` after a typing key other than the last one.
     pub typing_applies: usize,
+    /// The engine's units just before Enter (fluent-input contract section 1, `--readings`): finished syllables, then the unfinished symbols.
+    pub readings: Vec<String>,
+    /// Syllables the engine had committed on its own when `readings` was taken (they are not in it).
+    pub committed_syls: usize,
+    /// The time of each typing key (the engine call only).
+    pub key_times: Vec<Duration>,
+}
+
+/// Which keys a reading is typed with (fluent-input contract section 1, `--feed`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Feed {
+    /// Symbols in standard order, then the tone key or Space (today's replay).
+    Full,
+    /// Symbols of each syllable shuffled, tone key or Space still last.
+    Perm,
+    /// A first-tone syllable gets no Space when another syllable follows it; the last one still gets its Space.
+    Omit1,
+    /// The way `fluency` 2 is typed: a tone key for a toned syllable, nothing for a first-tone one, never Space.
+    Tones,
+    /// No tone key and no Space at all.
+    Toneless,
+}
+
+impl Feed {
+    pub fn parse(s: &str) -> Option<Feed> {
+        Some(match s {
+            "full" => Feed::Full,
+            "perm" => Feed::Perm,
+            "omit1" => Feed::Omit1,
+            "tones" => Feed::Tones,
+            "toneless" => Feed::Toneless,
+            _ => return None,
+        })
+    }
+}
+
+/// splitmix64: a seed that gives the same keys on every run and machine.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
 }
 
 /// The keys of one syllable: its symbols, then its tone key (Space for the first tone). `None` for a symbol without a key.
@@ -59,6 +107,33 @@ pub fn keys_of(syl: &str) -> Option<Vec<Key>> {
         v.push(Key::new(KeyKind::Space));
     }
     Some(v)
+}
+
+/// The keys of syllable `i` of `n` under `feed`; `rng` is only used by `Feed::Perm`.
+fn feed_keys(syl: &str, i: usize, n: usize, feed: Feed, rng: &mut Rng) -> Option<Vec<Key>> {
+    if feed == Feed::Full {
+        return keys_of(syl);
+    }
+    let layout = Layout::Standard;
+    let (mut syms, mut tone) = (Vec::new(), None);
+    for c in syl.chars() {
+        match layout.key_of_tone(c) {
+            Some(tk) => tone = Some(tk),
+            None => syms.push(Key::ch(layout.key_of_symbol(c)?, 0)),
+        }
+    }
+    if feed == Feed::Perm {
+        for j in (1..syms.len()).rev() {
+            syms.swap(j, (rng.next() % (j as u64 + 1)) as usize);
+        }
+    }
+    match (feed, tone) {
+        (_, Some(tk)) if feed != Feed::Toneless => syms.push(Key::ch(tk, 0)),
+        (Feed::Perm, None) => syms.push(Key::new(KeyKind::Space)),
+        (Feed::Omit1, None) if i + 1 == n => syms.push(Key::new(KeyKind::Space)),
+        _ => {}
+    }
+    Some(syms)
 }
 
 /// Keys to bring the cursor from `from` to `to` among `n` syllables: Left/Right one syllable each, or Home / End first.
@@ -93,6 +168,27 @@ pub fn build_engine(root: &Path, lm: &Path, tinylm: Option<&Path>, profile: Prof
     Ok(e)
 }
 
+/// The engine as `ios/Keyboard/Engine.swift` makes it (fluent-input contract section 1, `--ios`): no word pack, no trigram table, no
+/// small model, no rerank, no digit table; the same row, English and window settings as `build_engine`.
+pub fn build_engine_ios(root: &Path, lm: &Path, profile: Profile, learn: bool) -> Result<Engine, String> {
+    fn fail<T>(what: &'static str) -> impl Fn(T) -> String {
+        move |_| format!("{what} failed")
+    }
+    let mut e = Engine::new(&root.join("data/lexicon"), Layout::Standard).map_err(fail("engine build"))?;
+    e.clear_digit_table();
+    e.load_lm_without_trigram(lm).map_err(fail("load_lm"))?;
+    e.set_demote(true).map_err(fail("set_demote"))?;
+    e.set_prediction(false).map_err(fail("set_prediction"))?;
+    e.set_abbreviation(false).map_err(fail("set_abbreviation"))?;
+    e.set_english(false).map_err(fail("set_english"))?;
+    e.set_candidate_vertical(false).map_err(fail("set_candidate_vertical"))?;
+    e.set_profile(profile).map_err(fail("set_profile"))?;
+    if learn {
+        e.set_learning(true);
+    }
+    Ok(e)
+}
+
 struct Session<'a> {
     e: &'a mut Engine,
     cur: Option<Output>,
@@ -104,6 +200,7 @@ struct Session<'a> {
     rewrites: usize,
     cursor: usize,
     n: usize,
+    key_times: Vec<Duration>,
 }
 
 impl Session<'_> {
@@ -220,7 +317,18 @@ impl Session<'_> {
 /// `gold` is the row's sentence, compared with the display through `len`. Errors carry no row text. Text the engine commits while the
 /// row is typed (composition limit) is kept: it is part of the first display and of what is sent, and no pick can change it.
 pub fn replay_row(e: &mut Engine, ctx: &str, syls: &[String], gold: &str, len: &Lenient, cfg: Cfg) -> Result<RowOut, String> {
-    let per: Vec<Vec<Key>> = syls.iter().map(|s| keys_of(s).ok_or("a reading symbol has no key")).collect::<Result<_, _>>()?;
+    replay_row_feed(e, ctx, syls, gold, len, cfg, Feed::Full, 0)
+}
+
+/// `replay_row` with the keys of `feed`; `seed` is this row's (the random feeds only).
+#[allow(clippy::too_many_arguments)]
+pub fn replay_row_feed(e: &mut Engine, ctx: &str, syls: &[String], gold: &str, len: &Lenient, cfg: Cfg, feed: Feed, seed: u64) -> Result<RowOut, String> {
+    let mut rng = Rng(seed);
+    let per: Vec<Vec<Key>> = syls
+        .iter()
+        .enumerate()
+        .map(|(i, s)| feed_keys(s, i, syls.len(), feed, &mut rng).ok_or("a reading symbol has no key"))
+        .collect::<Result<_, _>>()?;
     // ends[s]: how many keys have been typed when syllable s is complete.
     let ends: Vec<usize> = per.iter().scan(0, |t, v| Some({ *t += v.len(); *t })).collect();
     let typed = per.concat();
@@ -229,12 +337,14 @@ pub fn replay_row(e: &mut Engine, ctx: &str, syls: &[String], gold: &str, len: &
     }
     e.set_left_context(ctx);
     let max_len = e.max_window_len();
-    let mut s = Session { e, cur: None, committed: String::new(), max_len, keys: 0, rewrites: 0, cursor: syls.len(), n: syls.len() };
+    let mut s = Session { e, cur: None, committed: String::new(), max_len, keys: 0, rewrites: 0, cursor: syls.len(), n: syls.len(), key_times: Vec::new() };
     let (mut out, last) = (RowOut { ideal: typed.len() + 1, ..RowOut::default() }, typed.len() - 1);
     let mut committed_syls = 0; // syllables complete when the engine last committed
     for (k, key) in typed.into_iter().enumerate() {
         let before = s.committed.len();
+        let t = Instant::now();
         s.press(key, true)?;
+        s.key_times.push(t.elapsed());
         if s.committed.len() > before {
             out.autocommit = true;
             committed_syls = ends.iter().filter(|&&end| end <= k + 1).count();
@@ -249,6 +359,7 @@ pub fn replay_row(e: &mut Engine, ctx: &str, syls: &[String], gold: &str, len: &
     }
     out.first = format!("{}{}", s.committed, s.cur().preedit);
     out.first_ok = len.apply(&out.first) == len.apply(gold);
+    (out.readings, out.committed_syls) = (s.e.readings(), committed_syls);
     // The composition holds the syllables after the committed ones, one character each, or the row is not fixable.
     if cfg.correct && s.committed.chars().count() == committed_syls {
         (s.n, s.cursor) = (syls.len() - committed_syls, syls.len() - committed_syls);
@@ -259,8 +370,46 @@ pub fn replay_row(e: &mut Engine, ctx: &str, syls: &[String], gold: &str, len: &
     out.committed = format!("{}{}", s.committed, s.cur().commit);
     out.final_ok = len.apply(&out.committed) == len.apply(gold);
     out.unfixable = cfg.correct && !out.final_ok;
-    (out.actual, out.rewrites) = (s.keys, s.rewrites);
+    (out.actual, out.rewrites, out.key_times) = (s.keys, s.rewrites, std::mem::take(&mut s.key_times));
     Ok(out)
+}
+
+/// Fluent-input contract section 2, acceptance 3: the boundaries after a first-tone syllable that another syllable follows (gold
+/// readings), and how many of them are a boundary in the engine's `readings` (compared by symbols typed so far, tone marks not
+/// counted). A boundary inside text the engine committed on its own is left out. Returns (boundaries, found).
+pub fn boundary_stats(rows: &[RowIn], outs: &[RowOut]) -> (usize, usize) {
+    let symbols = |s: &str| s.chars().filter(|&c| slot_of(c).is_some()).count();
+    let (mut total, mut found) = (0, 0);
+    for (r, o) in rows.iter().zip(outs) {
+        let mut ends = std::collections::HashSet::new();
+        let mut at: usize = r.syls[..o.committed_syls].iter().map(|s| symbols(s)).sum();
+        for u in &o.readings {
+            at += symbols(u);
+            ends.insert(at);
+        }
+        let mut at = 0;
+        for (i, s) in r.syls.iter().enumerate() {
+            at += symbols(s);
+            let first_tone = !s.chars().any(|c| Layout::Standard.key_of_tone(c).is_some());
+            if first_tone && i + 1 < r.syls.len() && i >= o.committed_syls {
+                total += 1;
+                found += ends.contains(&at) as usize;
+            }
+        }
+    }
+    (total, found)
+}
+
+/// `--readings` file: one line per row, the engine's units before Enter separated by spaces.
+pub fn format_readings(outs: &[RowOut]) -> String {
+    outs.iter().map(|o| format!("{}\n", o.readings.join(" "))).collect()
+}
+
+/// (p95, max) of the typing keys of all rows, in milliseconds; the p95 index is the replay test's (`len * 95 / 100`).
+pub fn key_latency_ms(outs: &[RowOut]) -> Option<(f64, f64)> {
+    let mut t: Vec<Duration> = outs.iter().flat_map(|o| o.key_times.iter().copied()).collect();
+    t.sort();
+    Some((t.get(t.len() * 95 / 100)?.as_secs_f64() * 1e3, t.last()?.as_secs_f64() * 1e3))
 }
 
 pub struct RowIn {
@@ -296,4 +445,57 @@ pub fn summary_line(name: &str, tag: &str, outs: &[RowOut], gold_chars: usize) -
         sum(|o| o.rewrites),
         sha256_hex(firsts.join("\n").as_bytes()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chars(v: &[Key]) -> String {
+        v.iter().map(|k| if k.kind == KeyKind::Space { '_' } else { k.ch }).collect()
+    }
+    fn row(feed: Feed, seed: u64, syls: &[&str]) -> Vec<String> {
+        let mut rng = Rng(seed);
+        (0..syls.len()).map(|i| chars(&feed_keys(syls[i], i, syls.len(), feed, &mut rng).unwrap())).collect()
+    }
+
+    #[test]
+    fn feeds_type_the_readings_as_documented() {
+        let s = ["ㄊㄚ", "ㄇㄣ˙", "ㄏㄠˇ"]; // standard keys: ㄊ=w ㄚ=8 ㄇ=a ㄣ=p ˙=7 ㄏ=c ㄠ=l ˇ=3... checked through the key table
+        let k = |sy: &str| chars(&keys_of(sy).unwrap());
+        assert_eq!(row(Feed::Full, 1, &s), [k("ㄊㄚ"), k("ㄇㄣ˙"), k("ㄏㄠˇ")]);
+        // Omit1: only the first-tone syllable that is not last loses its Space.
+        assert_eq!(row(Feed::Omit1, 1, &s), [k("ㄊㄚ").trim_end_matches('_').to_string(), k("ㄇㄣ˙"), k("ㄏㄠˇ")]);
+        assert_eq!(row(Feed::Omit1, 1, &["ㄊㄚ"]), [k("ㄊㄚ")], "a last first-tone syllable keeps its Space");
+        // Tones: tone key kept, Space never. Toneless: neither.
+        assert_eq!(row(Feed::Tones, 1, &s), [k("ㄊㄚ").trim_end_matches('_').to_string(), k("ㄇㄣ˙"), k("ㄏㄠˇ")]);
+        assert_eq!(row(Feed::Toneless, 1, &s), [k("ㄊㄚ").trim_end_matches('_').to_string(), k("ㄇㄣ˙")[..2].to_string(), k("ㄏㄠˇ")[..2].to_string()]);
+    }
+
+    #[test]
+    fn perm_is_seeded_keeps_the_tone_last_and_really_shuffles() {
+        let s = ["ㄍㄨㄛˇ", "ㄏㄨㄞˋ", "ㄒㄧㄠ"];
+        assert_eq!(row(Feed::Perm, 7, &s), row(Feed::Perm, 7, &s));
+        let full = row(Feed::Full, 0, &s);
+        assert!((0..20).any(|seed| row(Feed::Perm, seed, &s) != full), "some seed must reorder");
+        for seed in 0..20 {
+            for (p, f) in row(Feed::Perm, seed, &s).iter().zip(&full) {
+                let (mut a, mut b): (Vec<char>, Vec<char>) = (p.chars().collect(), f.chars().collect());
+                assert_eq!(a.pop(), b.pop(), "tone key or Space stays last");
+                a.sort();
+                b.sort();
+                assert_eq!(a, b, "same keys");
+            }
+        }
+    }
+
+    #[test]
+    fn boundaries_are_counted_by_symbols_after_first_tone_syllables() {
+        let rows = vec![RowIn { ctx: String::new(), sent: String::new(), syls: ["ㄊㄚ", "ㄇㄣ˙", "ㄇㄚ", "ㄇㄚ˙"].map(String::from).to_vec() }];
+        let out = |units: &[&str]| RowOut { readings: units.iter().map(|s| s.to_string()).collect(), ..RowOut::default() };
+        // Gold boundaries after ㄊㄚ (2 symbols) and after ㄇㄚ (5 symbols): two; ㄇㄣ˙ has a tone, so not one.
+        assert_eq!(boundary_stats(&rows, &[out(&["ㄊㄚ", "ㄇㄣ˙", "ㄇㄚ", "ㄇㄚ˙"])]), (2, 2));
+        assert_eq!(boundary_stats(&rows, &[out(&["ㄇㄚ", "ㄇㄚ˙"])]), (2, 1), "a lost syllable shifts the later boundaries");
+        assert_eq!(boundary_stats(&rows, &[out(&["ㄊㄚㄇㄣ˙", "ㄇㄚ", "ㄇㄚ˙"])]), (2, 1));
+    }
 }
