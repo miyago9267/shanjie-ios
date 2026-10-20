@@ -29,7 +29,7 @@
 4. **S-iOS-3 剪貼簿**：釘選片段（App Group）、鍵盤出現時抓到的最近項目、一鍵插入。
 5. **S-iOS-4 搜尋與翻譯**：需要 Full Access，預設關；搜尋 API 與翻譯後端另寫契約。
 
-輸入流暢度（符號不分順序、聲調可省略、鄰鍵與聲調容錯、整串縮寫）的分片與驗收見 `docs/contracts/fluent-input.md`。
+輸入流暢度（符號不分順序、聲調可省略、鄰鍵與聲調容錯、整串縮寫）的分片與驗收見 `docs/contracts/fluent-input.md`；輸入方式的切換鍵在底列蘋果表情符號的位置（`123` 右側，`KeyboardViewController.swift` 的 `modeKey`，目前只是 placeholder）。
 
 ## 3. S-iOS-0 驗收
 

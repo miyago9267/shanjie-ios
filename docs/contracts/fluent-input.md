@@ -1,51 +1,69 @@
 # 契約：流暢輸入（fluent-input）
 
-狀態：草稿（2026-10-20，等維護者確認、plan-verifier 審查後才實作）。四片依序做；第 2、3、4 片各有一個研究步驟（R），沒過規則就停在研究，不實作。這份契約是 fork 端 iOS 鍵盤（`docs/contracts/ios-keyboard.md`）的延伸；macOS 不變。
+狀態：草稿修訂一（2026-10-20：plan-critic 的 7 點 REVISE 已改，維護者 2026-10-20 的決定已記入 §0；等複審後才實作）。四片依序做，至少做到第 2 片；第 2、3、4 片各有一個研究步驟（R），沒過規則就停在研究，不實作。這份契約是 fork 端 iOS 鍵盤（`docs/contracts/ios-keyboard.md`）的延伸；macOS 不變。
 
 ## 0. 依據
 
 - 維護者 2026-10-20：iOS 上嚴格注音很痛（符號要照順序、每個音節都要聲調），要像 Rime 一樣流暢；選擇題「四片全做」，順序是符號不分順序、聲調可省略、鄰鍵與聲調容錯、整串縮寫。
+- **維護者決定（2026-10-20）**：
+  1. 至少實作到第 2 片。iOS 上 `fluency` 2（去調連打，含第 1 片的行為）在驗收通過後就是預設；macOS 不呼叫新函式，維持原行為、預設關。
+  2. **一聲不用打，沒有一聲鍵**：一聲就是「沒打聲調」，去調連打已涵蓋。設計裡不放 `Tone1` 鍵種與 ˉ 鍵；原本依賴它的驗收已改（§3 驗收 2、R2 第 1 項）。
+  3. 輸入方式的切換鍵放在蘋果表情符號的位置（底列 `123` 右側）。它已是 `ios/Keyboard/KeyboardViewController.swift` 的 placeholder（`modeKey`／`modeTapped`，只改 UI 狀態、沒通知引擎）；fluency 的入口也掛在這個鍵上，形式（短按、長按或選單）由 S-iOS-1 決定。
+  4. 第 3 片（容錯）與第 4 片（縮寫，研究門檻）留在計畫裡，排在第 2 片之後；之後另有一片「混打」（§6，另寫契約）。
 - 事實（2026-10-20 讀 code 與資料）：
   1. **符號不分順序今天就成立**。未完成音節是三欄 `pend: [Option<char>; 3]`（聲母、介音、韻母），每個注音鍵照 `Layout::symbol_of` 放進自己的欄位，`pending()` 照欄位順序輸出；同一欄再按是取代（`s3a.md` §2、第 9 條）。ㄠ 再 ㄏ 今天就是 ㄏㄠ。蘋果與小麥注音同樣取代（`s3a.md` 第 353 行：2026-10-06 實測，打 ㄉㄨㄟ、改打 ㄅ，Backspace 依序得到 ㄅㄨ、ㄅ）。repo 裡沒有小麥原始碼，`reference/` 只有 Python 原型。
-  2. **聲調鍵完成音節**，詞庫沒有的音節「已處理、不動作」（`finish_syllable`，`s3a.md` 第 10 條）。聲調不是欄位，也沒有「省略」：沒打聲調鍵的符號永遠是未完成。
+  2. **聲調鍵完成音節**，詞庫沒有的音節「已處理、不動作」（`finish_syllable`，`core/src/engine.rs` 2738–2741，`s3a.md` 第 10 條）。聲調不是欄位，沒打聲調鍵的符號永遠是未完成。
   3. **解碼器以音節字串為位置**：`lm::decode_segment_learned` 吃 `&[String]`，位置 i 到 j 是一個詞，查 `Lexicon::find(ids)` 的**完全吻合**讀音。引擎的 `syls` 一格一個已完成音節，游標、固定詞、候選窗都以音節為單位。
   4. 詞庫約 41 萬個讀音、1,413 個帶調音節、429 個去調音節（我用 Python 掃 `mcbpmf-data.txt` 加 `overlay-add.tsv` 數的）。詞庫裡有 21 個單聲母「音節」（如 `ㄅ ㄅ`，詞就是符號本身），只有 ㄓㄔㄕㄖㄗㄘㄙ 是真音節；去調後的字串很多能切成兩個音節（ㄒㄧㄢ＝ㄒㄧㄢ 或 ㄒㄧ＋ㄢ）：dev302 去調串（排除 14 個假單聲母）的切法數中位數 16、p90 128、最大 2²¹，typing76 中位數 32、最大 16,384。所以切分必須是動態規劃，不能列舉。
-  5. 縮寫組字器已存在（`abbr`、`Mode::PA`、`predict.rs` 的 `compat_abbr`），但 2026-10-10 被隱藏：沒做整句縮寫、兩個以上單位時空白與聲調鍵被吃掉（`v3-engine.md` §12.2、`PLAN.md` v0.4.0 段）。E3 整串縮寫沒過：dev302、p＝0.2，聊天 194／246＝0.789、書面 202／250＝0.808（門檻 0.9），瓶頸在排序不在候選（oracle@64 為 289／300，每個縮寫展開約 63 個讀音）（研究紀錄 2026-10-15）。
+  5. 縮寫組字器已存在（`abbr`、`Mode::PA`、`predict.rs` 的 `compat_abbr`），但 2026-10-10 被隱藏：沒做整句縮寫、兩個以上單位時空白與聲調鍵被吃掉（`v3-engine.md` §12.2、`PLAN.md` v0.4.0 段）。E3 整串縮寫沒過：dev302、p＝0.2，聊天 194／246＝0.789、書面 202／250＝0.808（門檻 0.9，分母是「全打」＝帶聲調全打的 top-1），瓶頸在排序不在候選（oracle@64 為 289／300，每個縮寫展開約 63 個讀音）（研究紀錄 2026-10-15）。
   6. 模糊輸入的離線結果（研究紀錄 2026-10-14，Python 參考解碼器，Mac 鍵盤鄰鍵）：G2 選到的 δ，聲調 3、模糊音 1、鄰鍵 2；p＝0.1、合法讀音那一格第一名救回聲調 62%、鄰鍵 82%，乾淨輸入改壞 1、3、4／1,000 列（模糊音不在這份契約）；延遲倍數 2.3–2.9（聲調）、1.8–2.1（鄰鍵）。
-  7. 效能與記憶體基準：dev302 重播每鍵 p95 2.34 ms（v0.4.5，研究紀錄 2026-10-15）；iOS 設定的 Mac 複製載入 phys_footprint 115 MB、打 50 鍵後 116 MB；extension 約在 177 MiB 被 jetsam（`ios-keyboard.md` §1）。
-  8. iOS 版面（`ios/Keyboard/KeyboardViewController.swift` 的 `rows`）：四列 11、10、10、10 個鍵，每列撐滿同一寬度；聲調鍵 ˇˋˊ˙ 夾在第一列的符號中間（ㄅㄉˇˋㄓˊ˙ㄚㄞㄢㄦ）。
+  7. 效能與記憶體基準：dev302 重播每鍵 p95 2.34 ms（v0.4.5，研究紀錄 2026-10-16；**不是 iOS 設定**，重播今天載入 acg 詞包，`lm` 旁有 `trigram.sjt3` 時也會一起載入），所以上限一律用當天 `--ios` 的 `fluency` 0 重量（§1）。iOS 設定的 Mac 複製載入 phys_footprint 115 MB、打 50 鍵後 116 MB（`ios-keyboard.md` §1，當時的臨時量測程式不在 repo）；extension 約在 177 MiB 被 jetsam。
+  8. iOS 版面（`ios/Keyboard/KeyboardViewController.swift` 的 `rows`）：四列 11、10、10、10 個鍵，每列撐滿同一寬度；聲調鍵 ˇˋˊ˙ 夾在第一列的符號中間（ㄅㄉˇˋㄓˊ˙ㄚㄞㄢㄦ）。沒有一聲鍵，所以版面不用改。
 - 「聲調提早打」的模型（Python，對詞庫的帶調音節窮舉所有符號順序與聲調位置；**不是引擎**，〔推論〕引擎行為相同）：聲調放在最後一個符號之前時，一出現合法音節就完成的做法只有 21% 還原成原音節；「等到不能再延伸才完成」是 48% 還原、其餘 52% 停在等待。結論：聲調提早打在沒有前瞻時無解，所以**不放進第 1 片**，聲調只當「關閉這個音節」的鍵（第 2 片也一樣）。
 - 去調串的「聲調一省略」邊界模型（Python）：dev302 與 typing76 裡一聲音節後面接著下一個音節的 609 處，下一個音節的第一個鍵若是欄位衝突或不能延伸，93%（564 處）能正確斷開、7%（45 處）會被併進前一個音節。
 
 ## 1. 總則
 
-- **一個設定，累進四級**：`fluency` 0 嚴格（今天）、1 順序不拘＋聲調一可省略、2 去調連打、3 整串縮寫。同時一個獨立的 `tolerance` 位元（bit0 聲調、bit1 鄰鍵，第 3 片），只在 `fluency ≥ 2` 生效。引擎預設 `fluency` 0、`tolerance` 0；macOS 的 shell 不呼叫新函式，行為與 golden **逐位元不變**。iOS 預設見 §7 問題 2。
+- **一個設定，累進四級**：`fluency` 0 嚴格（今天）、1 順序不拘＋一聲可省略、2 去調連打（含 1）、3 整串縮寫。同時一個獨立的 `tolerance` 位元（bit0 聲調、bit1 鄰鍵，第 3 片），只在 `fluency ≥ 2` 生效。引擎預設 `fluency` 0、`tolerance` 0；macOS 的 shell 不呼叫新函式，行為與 golden **逐位元不變**。iOS 預設見 §0 決定 1 與 §8 問題 2。
 - **C ABI 新增**（`core/include/shanjie.h`、`core/src/ffi.rs`，寫法照 `set_prediction`：2 表示值不合法且狀態不變，回傳快照）：
   - `shanjie_engine_set_fluency(engine, level, out)`，level 0–3。調低時，未斷定的尾巴先照最佳路徑斷定成音節（第 2 片 §3），不丟字。
   - `shanjie_engine_set_tolerance(engine, mask, out)`（第 3 片）。
   - `shanjie_engine_set_key_rects(engine, const ShanjieKeyRect *rects, uint32_t n)`，`{uint32_t ch; float x0, x1; uint32_t row}`（第 3 片，不回快照）：shell 把實際鍵位交給核心，核心導出鄰鍵；沒送就沒有鄰鍵。
-  - 新鍵種 `KeyKind::Tone1`＝16（明確的一聲，第 2 片）。`KeyKind::from_code` 與 C 標頭的 kind 列表同步擴充。
-- **共用工具**（第 1 片先做，之後各片共用）：`shanjie-replay`（`cli/src/replay.rs`、`cli/src/bin/replay.rs`）加 `--fluency N`、`--tolerance MASK`、`--rects FILE`、`--seed S` 與 `--feed MODE`：
-  - `full`（今天：符號照標準順序、每個音節以聲調鍵或空白收尾）；
+  - **不新增 `KeyKind`**（沒有一聲鍵）。`ffi.rs` 約 1354 行把 kind 16 當無效值的測試維持原樣；日後若真要加鍵種，該測試要改成下一個未用的值，並同步 `KeyKind::from_code` 與標頭的列表。
+- **`--ios` 設定**（第 1 片先做，之後所有數字都用它量）：`shanjie-replay` 與 `shanjie-eval` 加 `--ios`，等於 `ios/Keyboard/Engine.swift` 的引擎（`Engine(dataDir:)` 加 `loadLM`、`setProfile`，第 19、101–103 行）：**不載 trigram、不載詞包（無 acg）、不載 tinylm、不重排（`rerank` 關）、不放 `digits.tsv`**，其餘照現有重播（`cli/src/replay.rs` 72–94 的 `build_engine`）。
+  - 實作：`Engine` 加不讀三元表的載入入口，用既有的 `Lm::load_opts(…, tri=false)`（`core/src/lm.rs` 298–316；`Engine::load_lm` 今天走 `Lm::load`，會讀 `lm` 旁的 `trigram.sjt3`）；`build_engine` 用 `Engine::new`（不是 `new_with_packs`）、不呼叫 `load_tinylm`／`set_rerank`、清掉數字表；`cli/src/bin/replay.rs` 的 `models:` 行不列 `trigram.sjt3` 與 tinylm 雜湊，摘要 tag 用 `+ios` 取代 `+acg` 與 `+tl:`（第 82–99 行）。`--ios` 與 `--no-tinylm` 同時給不報錯。
+  - **驗收**：stderr 的 `models:` 行沒有 `trigram.sjt3`、tinylm 為 `none`；tag 含 `+ios`、不含 `+acg`；沒給 `--ios` 的輸出與 golden 逐位元不變；`--ios --fluency 0` 的 peak footprint 在 `/usr/bin/time -l` 下與 115–116 MB 相差 ≤ 5 MB（臨時量測程式不在 repo，所以用這個 harness 當替身：`shanjie-replay --ios --dev 302`，release，Mac 閒置；差超過就查來源，在此之前不報任何上限）。
+  - **本契約的每一張表與每一個基準都用 `--ios` 量**，包括「同設定」「`fluency` 0 基準」。
+- **共用工具**（第 1 片先做）：`shanjie-replay`（`cli/src/replay.rs`、`cli/src/bin/replay.rs`）加 `--fluency N`、`--tolerance MASK`、`--rects FILE`、`--seed S`、`--readings FILE` 與 `--feed MODE`：
+  - `full`（今天：符號照標準順序、每個音節以聲調鍵或空白收尾，一聲用空白）；
   - `perm`（每個音節的符號順序隨機洗牌，聲調鍵仍在最後）；
-  - `omit1`（一聲音節不按空白）；`toneless`（所有聲調鍵都不按）；`tonepart:P`（每個聲調鍵以機率 P 才按）；
-  - `noisy:tone:P`、`noisy:adj:P`（聲調換成同聲母韻母的另一個聲調；每個符號鍵與聲調鍵以機率 P 換成鄰鍵，鄰鍵取自 `--rects`，同鄰鍵均勻抽）；
-  - `abbr:P`（每個有聲母的音節以機率 P 只留聲母，第 4 片）。
+  - `omit1`（一聲音節只在**後面還有下一個音節**時省略空白；句尾的一聲音節照按空白再 Enter）；
+  - `tones`（`fluency ≥ 2` 用，iOS 上真正的有調打法：非一聲音節按聲調鍵，一聲音節什麼都不按，從不按空白）；
+  - `toneless`（所有聲調鍵與一聲空白都不按）；`tonepart:P`（非一聲音節的聲調鍵各以機率 P 才按，其餘同 `tones`）；
+  - `noisy:tone:P`、`noisy:adj:P`（只套在 `tones` 或 `toneless` 這條基底串上，基底見 §4；`tone`：聲調鍵換成另一個聲調，換成一聲就是刪掉那個鍵，一聲音節被換成別的聲調就多一個鍵；`adj`：每個符號鍵與聲調鍵以機率 P 換成鄰鍵，鄰鍵取自 `--rects`，同鄰鍵均勻抽）；
+  - `abbr:P`（套在 `tones` 上，每個有聲母的音節以機率 P 只留聲母並省略它的聲調鍵，第 4 片）。
+  - `--readings FILE`：每列一行，引擎在 Enter 前的音節邊界（音節以空白隔開，`fluency ≥ 2` 取斷定後的最佳路徑），是 §2 驗收 3「斷開處正確率」與 R2 的唯一來源。
+  - 隨機的 feed 一律由 `--seed` 決定，同種子跑兩次必須逐位元相同（每片驗收都核對，見各片）。
   - `core/tests/fixtures/ios-rects.tsv` 是第 3 片用的 iOS 鍵位（鍵、列、x0、x1，以 `rows` 的列長與等寬、間距 4、總寬 387 算）；`scripts/check-ios-rows.sh` 用正規式讀 Swift 的 `rows`，核對 fixture 的鍵與列長，改了 `rows` 而沒改 fixture 會失敗。
-- **共同指標**：整句 top-1 與逐列 `rowstats`（`shanjie-replay --rowstats`、`tools/evalstats.py compare --net`）；按鍵總數（`--keys`，含 `--correct` 的改選鍵）；每鍵 p95 與最大值；`/usr/bin/time -l` 的 peak memory footprint。集合：dev299＝`eval/dev/` 的 existing、homophones、oov 三檔共 299 列、typing76、user-reported，聊天與書面各報（dev302 含 user-reported 前 3 列，`fuzzy-research.md` §2 已說明，主判讀用 dev302 是因為 E3 與歷史數字用它）；參數選擇用 cvtune＋wikitune 各 500 列（在 188 跑，同 `fuzzy-research.md`）；保留集不用，只在推 tag 前由 fresh verifier 量。
-- **iOS 設定的量測**：`Engine::new` 加 `load_lm`，不載 trigram 與 tinylm，不放 `digits.tsv`，release；一律用這個設定量準確率與速度（trigram 與 tinylm 不在 iOS 出貨，`ios-keyboard.md` §1）。每個數字三輪取中位數，機器閒置時量（研究紀錄多次因負載污染速度欄）。
-- **共同上限**（每片 PR 都要量；超過就停）：
+- **共同指標**：整句 top-1 與逐列 `rowstats`（`shanjie-replay --rowstats`、`tools/evalstats.py compare --net`）；按鍵總數（`--keys`，含 `--correct` 的改選鍵）；每鍵 p95 與最大值；`/usr/bin/time -l` 的 peak memory footprint。集合：dev299＝`eval/dev/` 的 existing、homophones、oov 三檔共 299 列、typing76、user-reported，聊天與書面各報（dev302 含 user-reported 前 3 列，`fuzzy-research.md` §2 已說明，主判讀用 dev302 是因為 E3 與歷史數字用它）；參數選擇用 cvtune＋wikitune 各 500 列（在同 `fuzzy-research.md` §2 的量測機器跑）；保留集不用，只在推 tag 前由 fresh verifier 量。
+- **量測方式**：每個數字三輪取中位數，機器閒置時量（研究紀錄多次因負載污染速度欄）。
+- **共同上限**（每片 PR 都要量；超過就停；「基準」＝當天 `--ios --fluency 0` 同一台機器、同一場）：
 
 | 項目 | 第 1 片 | 第 2 片 | 第 3 片 | 第 4 片 |
 |---|---|---|---|---|
-| 每鍵 p95（dev302 重播，Mac；基準為當天 `fluency` 0 同設定，約 2.3 ms） | 基準＋0.3 ms | 去調串 ≤ 6 ms；帶調串 ≤ 基準＋1 ms | ≤ 8 ms | ≤ 12 ms |
+| 每鍵 p95（dev302 重播，Mac） | 基準＋0.3 ms | 去調串 ≤ 6 ms；帶調串 ≤ 基準＋1 ms | ≤ 8 ms | ≤ 12 ms |
 | 單鍵最大 | ≤ 30 ms | ≤ 30 ms | ≤ 30 ms | ≤ 30 ms |
-| peak footprint 相對 115 MB 基準（打 50 鍵後） | ＋0 | ＋4 MB | ＋5 MB（累計） | ＋8 MB（累計） |
+| peak footprint 相對基準 | ＋0 | ＋4 MB | ＋5 MB（累計） | ＋8 MB（累計） |
 | 載入時間 | ＋0 | ＋100 ms（索引在第一次 `fluency ≥ 2` 時才建） | ＋0 | ＋0 |
 
-  上限是預先寫定的猜測，依據是 §0 第 7 項的基準與方法論的每鍵 < 16 ms（`methodology.md` §1）；裝置的速度與記憶體沒量過，每片另在實機量：每鍵 p95 ≤ 16 ms、打 50 鍵後 extension footprint ≤ 150 MiB（jetsam 約 177 MiB，留 27 MiB 餘裕）〔推論：裝置比 Mac 慢，倍數未知〕。
+  上限是預先寫定的猜測，依據是 §0 第 7 項與方法論的每鍵 < 16 ms（`methodology.md` §1）；裝置的速度與記憶體沒量過，每片另在實機量：每鍵 p95 ≤ 16 ms、打 50 鍵後 extension footprint ≤ 150 MiB（jetsam 約 177 MiB，留 27 MiB 餘裕）〔推論：裝置比 Mac 慢，倍數未知〕。
 
-- **按鍵存活性**（防第 4 片隱藏時的卡鍵，所有 `fluency ≥ 1` 的片都要過）：固定種子的 10⁵ 個隨機鍵序（全部符號鍵、聲調鍵、`Tone1`、空白、Enter、Backspace、Esc、方向鍵、數字候選鍵，各級各一輪）。每一鍵之後：引擎沒有 panic、輸出一致；組字區非空時，空白、Enter、Backspace、Esc、聲調鍵都有定義好的效果，不得「已處理但狀態沒變」，名單內例外只有：沒有東西可關閉時的聲調鍵、組字區空時的 Backspace 直通；連按 Backspace 次數足夠必回到空；Esc 一次清空尾巴。
+- **按鍵存活性**（防第 4 片隱藏時的卡鍵，所有 `fluency ≥ 1` 的片都要過）：固定種子的 10⁵ 個隨機鍵序（全部符號鍵、聲調鍵、空白、Enter、Backspace、Esc、方向鍵、Home、End、Delete、Tab、數字候選鍵，各級各一輪）。每一鍵之後：引擎沒有 panic、輸出一致；組字區非空時，每個鍵都有定義好的效果，不得「已處理但狀態沒變」，**例外只有下列幾條，每條各有一個單元測試，鎖住「handled 與否、狀態與輸出不變」**：
+  1. 聲調鍵或空白，未完成音節（`fluency ≥ 2` 是尾巴最後一段）湊不成詞庫裡的帶調音節：不動作（`engine.rs` 2738–2741、`s3a.md` 第 10 條）。`fluency ≥ 2` 的判斷見 §3「按鍵」。
+  2. 有未完成音節時的 ←、→、↑、Home、End、Delete、Tab、PageUp、PageDown（`fluency` 0、1）：落到 `engine.rs` 2531 行的 fallthrough，不動作；Down 在預測列為空時也不開窗（iOS 預測列關）。`fluency ≥ 2` 這些鍵改走 §3 的尾巴規則，不再是例外。
+  3. 兩個以上單位時的聲調與空白不動作（`engine.rs` 2491，只在縮寫開時；iOS 不開，`fluency` 3 的做法見 §5，不得保留）。
+  4. 沒有東西可關閉時的聲調鍵、組字區空時的 Backspace 直通。
+  連按 Backspace 次數足夠必回到空；Esc 一次清空尾巴。
 - 文件：`s3a.md` 加對應的規則列（第 1 片的 9b、第 2 片的 9c 起），`ios-keyboard.md` §2 加一行指到這份契約。
 
 ## 2. 第 1 片：順序不拘、一聲可省略（`fluency` 1）
@@ -57,19 +75,20 @@
   1. `P[c]` 空，而且 P 加 k 是某個帶調音節（任何聲調）的子集合 → 放進欄位（今天的行為）。
   2. 否則（`P[c]` 已有符號，或加了 k 不能延伸成任何音節）：若 P 本身是一聲音節（`lex.entries(&[P])` 非空）→ **P 以一聲完成，k 開新音節**；否則 → 取代（`P[c]` 有符號）或放進欄位（沒有，今天的行為，之後仍會被第 10 條擋下）。
   3. 完整輸入（每個音節都按聲調鍵或空白）永遠走不到第 2 條，所以乾淨輸入逐位元不變。
-- 聲調提早打不支援（§0 模型）；聲調鍵的行為不變。
+- 聲調提早打不支援（§0 模型）；聲調鍵與空白的行為不變。
 
 核心改動：
 
 - 新檔 `core/src/syllable.rs`：符號分欄（`slot_of`）、把詞庫音節轉成三欄表（1,413 項，載入時建，約 20 KB）、「子集合延伸」判斷。第 2、3 片共用。
 - `core/src/engine.rs`：`fluency: u8` 欄位；`dispatch` 第 9 條的注音鍵分支（`has_pending` 且有 `zy` 處）在取代前先問新界線，成立時走 `finish_syllable(0, …)` 再 `start_syllable`。
 - `core/src/ffi.rs`、`core/include/shanjie.h`：`set_fluency`（0 或 1，大於 3 回 2）。
+- `--ios`、`--readings` 與 §1 的 feed（`full`、`perm`、`omit1`、`toneless`）。
 
-驗收（預先寫定）：
+驗收（預先寫定，全部用 `--ios`）：
 
 1. **鎖住既有行為**：對 1,413 個帶調音節（扣 14 個假單聲母），符號鍵所有排列加聲調鍵在最後，引擎（`fluency` 0 與 1）都得到同一個音節：100%。
 2. **乾淨輸入不變**：`--feed full`，`fluency` 1 與 0 的 `top1_sha256` 逐位元相同：dev302、typing76、user-reported，聊天與書面，共六組。任一組不同就停。
-3. **增益（`omit1`）**：dev302，聊天與書面各報 `fluency` 0 與 1 的 top-1、按鍵總數、斷開處正確率（引擎輸出的音節邊界等於正解的比例）。通過：`fluency` 1 的斷開處正確率 ≥ 90%（模型 93%，§0）而且 top-1 ≥ `full` 的 0.75 倍；`fluency` 0 只報（預期很差，因為被取代的音節直接消失）。0.75 是預先寫定的猜測：一句約有 3 個一聲音節在中間，0.93³≈0.80。
+3. **增益（`omit1`）**：dev302，聊天與書面各報 `fluency` 0 與 1 的 top-1、按鍵總數、**斷開處正確率**。斷開處＝正解裡「一聲音節後面接著下一個音節」的邊界（§0 的 609 處同一個定義）；正確率＝其中 `--readings` 輸出在該位置有邊界的比例。通過：`fluency` 1 的斷開處正確率 ≥ 90%（模型 93%，§0）而且 top-1 ≥ `full` 的 0.75 倍；`fluency` 0 只報（預期很差，因為被取代的音節直接消失）。0.75 是預先寫定的猜測：一句約有 3 個一聲音節在中間，0.93³≈0.80。
 4. 延遲與記憶體照 §1 的表；存活性照 §1。
 5. 單元測試（改壞就失敗）：欄位衝突斷開、`P` 不是一聲音節時仍取代、`P[c]` 空且可延伸時放進欄位、Backspace 回到斷開前的狀態（刪最後一個符號，音節已完成則照第 18 條）。
 
@@ -82,37 +101,39 @@
 研究步驟 R2（先做、沒過就停，不碰引擎）：
 
 - 離線格狀解碼：`core/src/lm.rs` 加 `decode_lattice`；`shanjie-eval` 加 `--toneless`（去調串直接餵格狀解碼，不經過引擎）。
-- **格狀的定義**：節點是符號串的位置；一條邊是串上連續的一段，段內符號分欄後（順序不拘）每欄至多一個，結果是某個合法音節（去調後在 429 個去調音節裡，排除 14 個假單聲母）。聲調鍵是**硬邊界**：它關閉當時那一段，並把那個音節限定為該聲調；`Tone1` 同樣限定一聲；沒按聲調鍵的音節是任意聲調。段內欄位衝突（兩個聲母）必然是邊界。
+- **格狀的定義**：節點是符號串的位置；一條邊是串上連續的一段，段內符號分欄後（順序不拘）每欄至多一個，結果是某個合法音節（去調後在 429 個去調音節裡，排除 14 個假單聲母）。聲調鍵是**硬邊界**：它關閉當時那一段，並把那個音節限定為該聲調；沒按聲調鍵的音節是任意聲調（包含一聲，一聲沒有鍵）。段內欄位衝突（兩個聲母）必然是邊界。
 - 詞的查詢走**去調索引**：`Lexicon` 新增 `tl_index: Vec<u32>`，把每個讀音按「每個音節去調後的 id 序列」排序，只存讀音編號（約 41 萬 × 4 B≈1.6 MB 〔推論〕），第一次 `fluency ≥ 2` 才建。從一個節點出發，沿邊深度優先走，用前綴二分搜尋剪枝，吻合的讀音再依各音節的聲調限定過濾；分數與 `decode_segment_learned` 同一套（詞的 lp、λ、KN、bigram，不加聲調懲罰；學習與新詞照 `Learn` 以實際讀音查）。同一 (字串, 最後一個詞) 只留一條路（`dec-recombine.md`）。
 - 因為內圈（詞的鬆弛、學習、降權）與 `decode_segment_learned` 相同，**抽成共用函式**，兩個解碼器都呼叫；抽出後音節版的輸出必須逐位元不變（核對 §1 的 golden）。
-- R2 通過規則（預先寫定，iOS 設定，dev302，聊天與書面各一次，兩次都要過）：
-  1. 帶調串走格狀，`top1_sha256` 與音節版逐位元相同（dev302、typing76、user-reported 各兩種設定）。
-  2. 全部聲調都不按（`toneless`）：top-1 ≥ 同設定帶調串 top-1 的 0.85 倍。
-  3. 每個聲調鍵以 0.5 的機率才按（`tonepart:0.5`）：top-1 不低於 `toneless`（多一個硬限定不該更差）。
-  4. 只報：typing76、user-reported 的同樣數字；斷開處正確率；oracle@9；平均每鍵格狀邊數。
+- R2 通過規則（預先寫定，`--ios`，dev302，聊天與書面各一次，兩次都要過；「基準」＝`fluency` 0 `--feed full` 的音節版 top-1）：
+  1. 帶調串走格狀，`top1_sha256` 與音節版逐位元相同（dev302、typing76、user-reported 各兩種設定）。沒有一聲鍵，所以這一項在解碼器層做：離線輸入的每個音節帶「聲調已指定」的標記（一聲也有），這個標記只存在於測試輸入，不是按鍵。
+  2. 全部聲調都不按（`toneless`）：top-1 ≥ 基準的 0.85 倍。
+  3. 非一聲音節的聲調鍵各以 0.5 的機率才按（`tonepart:0.5`）：top-1 不低於 `toneless`（多一個硬限定不該更差）。
+  4. 只報：typing76、user-reported 的同樣數字；`tones` 的 top-1；斷開處正確率；oracle@9；平均每鍵格狀邊數。
   0.85 是預先寫定的猜測，沒有先例（E3 的 0.9 是縮寫）；沒過就記錄瓶頸（切分、聲調，還是排序），不降門檻。
 
 引擎整合（R2 過了才做）：
 
 - 組字區多一個**尾巴** `tail: Vec<Raw>`（符號或聲調鍵），只存在於游標在尾端、`fluency ≥ 2` 時；`syls`、`fixed` 的不變式（一格一個帶調音節）不動。
-- 按鍵（尾巴非空時，每個鍵都有定義）：注音鍵追加；聲調鍵與 `Tone1` 追加並關閉該段；Backspace 刪最後一個鍵（一鍵一個符號）；Esc 清尾巴；Enter 送出顯示的整串（尾巴沒分完的符號照今天第 12a 條原樣送出）；Space、↓ 開候選窗（今天第 15 條），窗已開時 Space 翻頁；←→、Home、End、標點先**斷定**尾巴再照原規則。
+- **按鍵**（尾巴非空時，每個鍵都有定義，唯一例外是 §1 存活性第 1 條）：注音鍵追加；聲調鍵追加並關閉該段，但只有在「尾巴最後一段的某種切法，最後一個音節加這個聲調是詞庫裡的帶調音節」時才收，否則不動作（同今天第 10 條，使用者當場會發現）；Backspace 刪最後一個鍵（一鍵一個符號）；Esc 清尾巴；Enter 送出顯示的整串（尾巴沒分完的符號照今天第 12a 條原樣送出）；Space、↓ 開候選窗（今天第 15 條），窗已開時 Space 翻頁；←→、Home、End、標點先**斷定**尾巴再照原規則。
 - **斷定**：把尾巴以目前最佳路徑轉成帶調音節放進 `syls`（沒按聲調的音節用路徑詞的讀音），不產生固定詞；不是使用者的選擇，所以不學習（同 Enter 的學習規則）。尾巴超過 36 個符號時，斷定到只剩最後 12 個符號。
 - 顯示：最佳**全覆蓋**路徑的字；沒有全覆蓋路徑（尾端是不完整的音節，如剛按的聲母）時，最佳前綴路徑加上尾端的原符號。
 - 候選窗：列出覆蓋尾巴開頭的詞（長的在前，同今天窗），每項帶它消耗的符號數與帶調讀音；選取後這幾個符號變成 `syls` 加固定詞（等同 `apply_pred` 的切入），剩下的尾巴留著。整句 n-best 排在最後。
-- 核心改動：`core/src/lib.rs`（`tl_index`、`find_toneless`）、`core/src/lm.rs`（`decode_lattice`、共用內圈）、`core/src/syllable.rs`（邊的產生）、`core/src/engine.rs`（尾巴、按鍵、`refresh_lm` 的最後一段改走格狀、候選窗）、`core/src/ffi.rs` 與標頭（level 2、`Tone1`）。
-- iOS shell（`ios/Keyboard/Engine.swift`、`KeyboardViewController.swift`）：包 `setFluency`、`key(16)`；`fluency ≥ 2` 時空白鍵不再用 `pendingSyllable` 判斷，composing 就送出整串（維持現況「空白送出」的手感），開候選窗靠候選列的 chevron；一聲鍵 `ˉ` 的位置待定（§7 問題 3）。
+- 核心改動：`core/src/lib.rs`（`tl_index`、`find_toneless`）、`core/src/lm.rs`（`decode_lattice`、共用內圈）、`core/src/syllable.rs`（邊的產生）、`core/src/engine.rs`（尾巴、按鍵、`refresh_lm` 的最後一段改走格狀、候選窗）、`core/src/ffi.rs` 與標頭（level 2）。
+- iOS shell（`ios/Keyboard/Engine.swift`、`KeyboardViewController.swift`）：包 `setFluency`；`fluency ≥ 2` 時空白鍵不再用 `pendingSyllable` 判斷，composing 就送出整串（維持現況「空白送出」的手感），開候選窗靠候選列的 chevron；輸入方式切換鍵（§0 決定 3）放 fluency 入口。
 
-驗收（預先寫定）：
+**`--correct` 在 `fluency ≥ 2` 的改選協議**（第 2、3、4 片共用）：原協議（`engine-replay.md` §4）假設游標在 `syls` 上、候選窗以游標為結尾，尾巴窗（列覆蓋尾巴**開頭**的詞）不適用，所以不在尾巴窗裡改選。打完後若顯示的文字不等於正解：先送一個 `End`（斷定尾巴，計 1 鍵；尾巴為空就不送），之後照原協議走，斷定後的 `syls` 與固定詞的結構和 `fluency` 0 相同。斷定出的音節數與正解不同（切錯了）→ 記成改不了（`unfixable`），不再嘗試。**核對**：同種子（`--seed`）跑兩次，`Σactual`、`unfixable`、`top1_sha256` 逐位元相同。
 
-1. R2 的四項在引擎路徑（`shanjie-replay --fluency 2`）重做，數字與離線一致（top-1 逐列相同）。
-2. 帶調輸入（`--feed full`，一聲用 `Tone1`）`top1_sha256` 與 `fluency` 0 逐位元相同：六組。
-3. **按鍵總數**（`--feed toneless --correct`）：dev302 與 typing76，Σactual ≤ `fluency` 0 `full --correct` 的 0.90 倍（沒按的聲調鍵省下來的，扣掉多出來的改選）。0.90 是預先寫定的猜測。
+驗收（預先寫定，`--ios`）：
+
+1. R2 的第 2–4 項在引擎路徑（`shanjie-replay --fluency 2`）重做，數字與離線一致（top-1 逐列相同）；第 1 項是解碼器層的檢查、引擎路徑沒有「聲調已指定」的按鍵，所以在引擎路徑改核對 `--feed tones` 的 top-1 逐列與離線 `tones` 相同。
+2. **帶調輸入不退步**：`--feed tones` 的 `fluency` 2 top-1 ≥ `--feed omit1` 的 `fluency` 1 top-1（同一批句子的同一種真實打法，格狀至少不輸邊界規則）：dev302、typing76、user-reported，聊天與書面，六組；另報對 `fluency` 0 `full` 的比值。任一組低於就停。
+3. **按鍵總數**（`--feed toneless --correct`，改選照上面的協議）：dev302 與 typing76，`Σactual` ≤ `fluency` 0 `full --correct` 的 0.90 倍，而且 `unfixable` 列數 ≤ 基準的列數＋3（dev302 約 1%）。0.90 與這個 3 是預先寫定的猜測。
 4. 延遲、記憶體、存活性照 §1（去調串 ≤ 6 ms、＋4 MB、載入 ＋100 ms）。
-5. 單元測試：切分歧義（ㄒㄧㄢ 在不同前後文分成一個或兩個音節）、聲調硬限定改變選字、尾巴斷定後 `syls` 不變式、窗選取消耗符號數、Backspace 連按回空、`fluency` 2→1 不丟字。
+5. 單元測試：切分歧義（ㄒㄧㄢ 在不同前後文分成一個或兩個音節）、聲調硬限定改變選字、聲調鍵湊不成音節時不動作、尾巴斷定後 `syls` 不變式、窗選取消耗符號數、Backspace 連按回空、`fluency` 2→1 不丟字。
 
-怎麼看到：iOS 上連打 ㄋㄧㄏㄠ，出現「你好」，不用按任何聲調；打 ㄒㄧㄢ 後面接 ㄕㄥ 時由語言模型決定切法。
+怎麼看到：iOS 上連打 ㄋㄧㄏㄠ，出現「你好」，不用按任何聲調，一聲也不用打；打 ㄒㄧㄢ 後面接 ㄕㄥ 時由語言模型決定切法。
 
-停止條件：R2 任一項沒過（回報數字與瓶頸）；驗收 2 任一組不同；p95 或 footprint 超過上限。
+停止條件：R2 任一項沒過（回報數字與瓶頸）；驗收 2 任一組退步；p95 或 footprint 超過上限。
 
 ## 4. 第 3 片：聲調與鄰鍵容錯（`tolerance`，需 `fluency` 2）
 
@@ -121,12 +142,14 @@
 - **鄰鍵用 iOS 實際鍵位**：鄰鍵的規則是「同一列左右相鄰的鍵，加上相鄰兩列裡水平範圍與這個鍵有重疊的鍵」（Mac 版只有同一列左右）。依 `rows` 與總寬 387、間距 4 算（我算過，〔推論〕規則本身是我定的）：平均每個鍵 3.7 個鄰鍵，37 個符號鍵裡有 9 個鍵挨著聲調鍵（ㄉ、ㄓ、ㄚ 等），例：ㄅ→ㄉㄆ，ㄓ→ˋˊㄐㄔ，ㄚ→˙ㄞㄧㄛ。鍵位由 shell 用 `set_key_rects` 交給核心，核心只實作規則（`core/src/syllable.rs`），模擬工具與 shell 用同一份。聲調鍵也是鄰鍵：把符號鍵打到聲調鍵上，或反過來，是這個平台新的錯誤種類（上一次研究排除的分段錯誤，現在放進格狀）。
 - **做法**：格狀每條邊的符號可換成鄰鍵的符號，每換一個鍵扣 δ_a；`tolerance` bit0 時，聲調鍵不再是硬限定，詞的聲調與打的聲調不同就扣 δ_t。每個詞最多一個音節用容錯（同研究）。閘門用 G2（容錯讀音直接進格狀，扣固定 δ）；G2 守不住門檻時退到 G1（完全吻合的前 5 名不動，容錯整句只接在後面最多 4 句），不另開討論。
 - R3（先做，沒過就停）：
+  - **基底串**：`noisy:tone` 只有 `tones` 這條基底有聲調鍵可換，所以只用 `tones`；`noisy:adj` 兩條基底都量（`tones`、`toneless`）。**通過規則只看 `tones` 基底**（與 2026-10-14 的 Python 數字可比，那次也是有調輸入）；`toneless` 基底只報，不當門檻，若維護者想以去調為準要在動工前改。
+  - **合法的定義**（取代第 10 條的「合法讀音」）：`fluency` 2、`tolerance` 關時，注入後的串仍有全覆蓋的格狀路徑。沒有全覆蓋路徑的是「不合法」那一格（只報）。分母＝合法、注入後讀音有改變、乾淨輸入沒解錯、`tolerance` 關時 top-1 解錯的列；救回＝`tolerance` 開後 top-1 等於正解。
   - 選 δ：cvtune＋wikitune 各 500 列，p＝0.1，每種錯誤各選一次，乾淨輸入改壞 ≤ 5／1,000 列之下第一名救回最多，同分取大 δ（同研究的規則）。
-  - 通過規則（dev299＋typing76，聊天與書面各一次，p＝0.1，只看**合法讀音**那一格，即今天打錯了卻沒被第 10 條擋下的）：`noisy:adj:0.1` 第一名救回 ≥ 60%（Python 的 82%，扣 20 點給新鍵位、垂直鄰鍵與去調歧義〔推論〕）；`noisy:tone:0.1` 救回 ≥ 55%（Python 62%）；乾淨輸入（`tolerance` 開、完整與去調兩種串）改壞：選 δ 的 1,000 列 ≤ 5，dev299＋typing76 兩種設定各 ≤ 2 列。
-  - 只報：p＝0.05、0.2；第一名與前 9 名；不合法讀音那一格（第 10 條擋下的）；延遲倍數。
+  - 通過規則（dev299＋typing76，聊天與書面各一次，p＝0.1，`tones` 基底，只看合法那一格）：`noisy:adj:0.1` 第一名救回 ≥ 60%（Python 的 82%，扣 20 點給新鍵位、垂直鄰鍵與去調歧義〔推論〕）；`noisy:tone:0.1` 救回 ≥ 55%（Python 62%）；乾淨輸入（`tolerance` 開、`tones` 與 `toneless` 兩種串）改壞：選 δ 的 1,000 列 ≤ 5，dev299＋typing76 兩種設定各 ≤ 2 列。
+  - **報表的形狀同研究紀錄 2026-10-14**：(a) 選 δ 表，種類（聲調、鄰鍵）× δ（0.5、1、2、3、4）× 每格「第一名救回列數／乾淨輸入改壞列數（以 1,000 列計）」，標出選到的 δ；(b) 救回表，欄位：種類、p、換成的讀音（合法／不合法）、n、乾淨就錯、解錯列、閘門第一名／前 9 名（含百分比），p＝0.05、0.1、0.2 各一列，分 `tones` 與 `toneless` 基底；(c) 乾淨輸入改壞與延遲倍數。只報：p＝0.05、0.2；前 9 名；不合法那一格；延遲倍數。
 - 核心改動：`core/src/syllable.rs`（鄰鍵規則、容錯邊的產生）、`core/src/lm.rs`（`decode_lattice` 加容錯邊與 δ）、`core/src/engine.rs`（`tolerance`、`key_rects`）、`core/src/ffi.rs` 與標頭、`shanjie-replay`（`noisy` feed 與 `--rects`）、`ios-rects.tsv` 與 `check-ios-rows.sh`。
-- iOS shell：版面載入後與版面改變（單手、鍵高，S-iOS-2）時把每個鍵的 frame 轉成 `ShanjieKeyRect` 送出；設定兩個開關（預設見 §7）。macOS 不呼叫。
-- 驗收：R3 的規則在引擎路徑重做（逐列相同）；帶調與去調的乾淨串在 `tolerance` 關時 `top1_sha256` 與第 2 片相同；p95 ≤ 8 ms、footprint 累計 ＋5 MB；存活性、單元測試（鄰鍵規則對 fixture、容錯邊只換一個鍵、δ 為 0 時等於沒開）。
+- iOS shell：版面載入後與版面改變（單手、鍵高，S-iOS-2）時把每個鍵的 frame 轉成 `ShanjieKeyRect` 送出；設定兩個開關（預設見 §8）。macOS 不呼叫。
+- 驗收：R3 的規則在引擎路徑重做（逐列相同；`--correct` 照 §3 的協議，同種子兩次的 `Σactual`、`unfixable` 相同）；`tones` 與 `toneless` 的乾淨串在 `tolerance` 關時 `top1_sha256` 與第 2 片相同；p95 ≤ 8 ms、footprint 累計 ＋5 MB；存活性、單元測試（鄰鍵規則對 fixture、容錯邊只換一個鍵、δ 為 0 時等於沒開）。
 - 停止條件：R3 沒過（記錄；上一次的結論是鄰鍵風險最高，typing76 改壞 4／76）；乾淨輸入改壞超過上限；`tolerance` 關時任何輸出改變。
 - 怎麼看到：iOS 上把 ㄏ 打成鄰鍵 ㄘ 或 ㄈ，整句仍是想要的字（第一名）；乾淨輸入沒有被改壞。
 
@@ -134,35 +157,49 @@
 
 這一片**先是研究**，過了規則才實作。前一次沒過的原因（E3，§0 第 5 項）是排序，不是候選；隱藏舊縮寫組字器的原因是卡鍵（兩個以上單位時空白與聲調鍵被吃掉）與沒有整句支援，不是詞庫。
 
-- R4 研究步驟：在第 2 片的格狀上，一條邊除了完整音節，也接受「單位」＝以這些符號為開頭的任何音節（`compat_abbr` 的語意），每個縮寫單位扣 δ_b；聲調鍵與 `Tone1` 仍是硬邊界，把單位定成完整。`shanjie-eval --toneless --abbr`。
-- **通過規則（預先寫定，不放寬）**：iOS 設定（無三元表、無 tinylm）；`--feed abbr:0.2`（每個有聲母的音節以 0.2 的機率只留聲母，種子固定，同 E3 的產生方式）；dev302，聊天與書面都要：top-1 ≥ 同設定完整輸入 top-1 的 0.90 倍（E3 的門檻，一個字不改）；同一串每鍵 p95 ≤ 12 ms（E3 的 Python 每列 148 ms，一鍵要能在 12 ms 內算完）。δ_b 在 cvtune＋wikitune 選（乾淨輸入改壞 ≤ 5／1,000）。
-- 只報：p＝0.5、1.0（E3 的 p）；前 9 名；oracle@9；有沒有三元表；平均每鍵邊數。
+- R4 研究步驟：在第 2 片的格狀上，一條邊除了完整音節，也接受「單位」＝以這些符號為開頭的任何音節（`compat_abbr` 的語意），每個縮寫單位扣 δ_b；聲調鍵仍是硬邊界，把單位定成完整。`shanjie-eval --toneless --abbr`。
+- **縮寫套用的串與基準**（同 E3）：`abbr:P` 套在帶聲調全打的 `tones` 上（每個有聲母的音節以機率 P 只留聲母、省略它的聲調鍵，其餘音節照 `tones`）；基準＝同一批句子、同一個引擎（`--ios`，`fluency` 2）的 `--feed tones` top-1，對應 E3 的「全打」；另報對 `--feed toneless` top-1 的比值（只報，不當門檻）。
+- **通過規則（預先寫定，不放寬）**：`--ios`（無三元表、無詞包、無 tinylm）；`--feed abbr:0.2`（種子固定，同 E3 的產生方式）；dev302，聊天與書面都要：top-1 ≥ `tones` top-1 的 0.90 倍（E3 的門檻，一個字不改）；同一串每鍵 p95 ≤ 12 ms（E3 的 Python 每列 148 ms，一鍵要能在 12 ms 內算完）。δ_b 在 cvtune＋wikitune 選（乾淨輸入改壞 ≤ 5／1,000）。
+- **摘要行**列出：abbr top-1、`toneless` top-1、`tones` top-1、種子、`--ios` 設定標記；同種子跑兩次，top-1 與按鍵總數逐位元相同。
+- 只報：p＝0.5、1.0（E3 的 p）；前 9 名；oracle@9；平均每鍵邊數；按鍵總數（`--correct`，照 §3 的協議）。
 - 不過：記錄瓶頸（排序或候選爆炸，同 E3 的寫法），隱藏的 `set_abbreviation` 照舊，第 4 片收尾，不實作。只有加上 trigram 或 tinylm 才過也算不過（iOS 不出貨它們）；那種結果另開契約討論。
 - 過了才做（避免舊失敗模式）：
   - `fluency` 3 取代舊的縮寫組字器路徑；`set_abbreviation` 保持隱藏，不接 iOS。
   - 沒有「多個單位就吃鍵」：所有鍵照 §3 的表有效果，存活性（§1）要過；空白與 Enter 一定能送出整串，Esc、Backspace 一定能退。
   - 整句縮寫由格狀的 top-1 與候選窗給出；預測列不是唯一出口。
-  - 驗收：R4 規則在引擎路徑重做；帶調與去調的乾淨串在 `fluency` 3 的 top-1 與第 2 片逐列比，改壞 ≤ 0.5%；存活性；p95 ≤ 12 ms、footprint 累計 ＋8 MB。
+  - 驗收：R4 規則在引擎路徑重做；`tones` 與 `toneless` 的乾淨串在 `fluency` 3 的 top-1 與第 2 片逐列比，改壞 ≤ 0.5%；存活性；p95 ≤ 12 ms、footprint 累計 ＋8 MB。
 - 停止條件：R4 沒過；實作後乾淨輸入改壞超過上限；存活性有任何卡鍵。
 
-## 6. 範圍外
+## 6. 之後的一片：混打（只列方向，另寫契約）
 
-保留集（只在推 tag 前量）；觸控點座標的機率模型（只用離散鄰鍵）；多語言、中英混打在流暢模式下的互動（`fluency ≥ 2` 時中英混打維持關，另寫契約）；倚天排列；macOS 的任何行為；聲調提早打（§0 模型）；Release 與簽章。
+不在第 1–4 片裡，`fluency ≥ 2` 時中英混打維持關。維護者的 Rime 設定 `myg_bpmf` 是參考（〔轉述〕維護者 2026-10-20 的描述，沒有讀過那份設定）：注音模式裡就會出現日文與英文候選、「注音文」是候選之一、表情符號不排第一個候選。
 
-## 7. 要維護者決定的事
+- **兩個建置，兩套詞典來源**：
+  1. 自簽建置：建置時從本機的 myg-rime 檢出拉洋蔥詞典（路徑放 `.agent-local/`，**不進版控、不寫進任何追蹤檔案**）。那份詞典沒有授權，並註明「請勿使用於商業營利相關行為」，所以產物只存在自簽建置，不進 repo、不進 App Store 建置。
+  2. App Store 建置：只用授權明確的開放來源，例如英文用 ECDICT（MIT）、日文用 JMdict 類來源〔授權與標示義務動工前核對〕、表情符號的註解用 Unicode CLDR。
+- **記憶體**：myg-rime 的那些詞典約 150 MB 的 YAML，不能整個載入；必須編成 mmap 格式（唯讀映射的乾淨頁不算 phys_footprint，同 trigram-mmap），並為每個功能寫死 footprint 上限，對照 jetsam 約 177 MiB（`ios-keyboard.md` §1；今天 `--ios` 的基準約 116 MB，餘裕有限）。上限數字在那份契約定，量法同 §1。
+- 範圍：候選排序規則（表情符號不第一、注音文怎麼進候選）、詞典編譯工具、兩個建置的切換，都在那份契約；這份契約不動。
+
+## 7. 範圍外
+
+保留集（只在推 tag 前量）；觸控點座標的機率模型（只用離散鄰鍵）；多語言與中英混打在 `fluency ≥ 2` 的互動（§6 另寫契約）；倚天排列；macOS 的任何行為；聲調提早打（§0 模型）；一聲鍵（維護者決定不做）；Release 與簽章。
+
+## 8. 要維護者決定的事
+
+已決（2026-10-20，見 §0）：做到至少第 2 片、iOS 預設 `fluency` 2、沒有一聲鍵、輸入方式切換鍵的位置、第 3、4 片留在計畫裡、混打另寫契約。
 
 1. 你說的「符號要照順序」是指蘋果內建鍵盤，還是善解 iOS 版？後者與 §0 事實 1 不符，請在實機打 ㄠ 再 ㄏ 確認；若真的壞了，要先查 shell，不是核心。
-2. 各級預設：建議 `fluency` 1 在第 1 片驗收過後直接預設開（行為只在原本會吃掉音節的情況改變），2、3 預設關，等你實機用一週再決定；`tolerance`、`fluency` 3 預設關。
-3. 一聲的鍵（第 1 列已滿，`ˉ` 要放哪）與空白鍵的語意：`fluency ≥ 2` 時建議空白＝送出整串、`ˉ`＝`Tone1`（長按某鍵或獨立小鍵）。
-4. 設定入口：沒有 Full Access 時，主 App 的設定寫不進 extension（`ios-keyboard.md` §1），輸入方式與容錯開關要在鍵盤內有入口〔推論，S-iOS-1 決定位置〕。
-5. 三個預先寫定的門檻（0.75、0.85、0.90）是猜測；想改請在動工前改，量到之後不改。
+2. 預設：iOS 在第 2 片驗收通過後 `fluency` 2；第 1 片驗收過到第 2 片通過之間，建議 iOS 先預設 `fluency` 1（行為只在原本會吞掉音節的情況改變）〔建議，未決〕；`tolerance`、`fluency` 3 預設關，等你實機用一週再決定。macOS 全部維持 0。
+3. 設定入口：沒有 Full Access 時，主 App 的設定寫不進 extension（`ios-keyboard.md` §1），fluency 與容錯開關要在鍵盤內有入口；位置已定（輸入方式切換鍵），形式〔推論，S-iOS-1 決定〕。
+4. 預先寫定的門檻（0.75、0.85、0.90、改壞上限與 `unfixable`＋3）是猜測；想改請在動工前改，量到之後不改。
 
-## 8. 限制、回滾與審查
+## 9. 限制、回滾與審查
 
 - executor：只改這份契約列的檔案，不碰 `macos/`、不連網、不讀保留集與私人資料、不 push。每片一個 PR，依序合併；R2、R3、R4 的結果各寫研究紀錄一節（數字、命令、雜湊）。
 - 回滾：每片獨立 revert；`fluency`、`tolerance` 預設 0，關掉就是今天的行為。
-- 審查：plan-verifier 審這份契約；每片程式過 `/code-review` 與 fresh verifier。
+- 審查：plan-critic 審這份契約；每片程式過 `/code-review` 與 fresh verifier。
 
 | 審查 | 結果 | 處置 |
 |---|---|---|
-| 草稿（2026-10-20） | 尚未審 | — |
+| 草稿（2026-10-20） | plan-critic：REVISE（7 點） | 修訂一：`--ios` 設定與 harness、omit1 與 `--readings`、存活性例外、`--correct` 協議與決定性、R3 合法與基底串與報表、R4 串與基準、移除私人主機代號；非阻擋兩項已改 |
+| 修訂一（2026-10-20） | 尚未複審 | — |
