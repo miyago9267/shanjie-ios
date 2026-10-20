@@ -28,6 +28,12 @@ final class Engine {
         _ = copy(shanjie_engine_set_profile(h, p, &out), out)
     }
 
+    /// Fluent-input contract section 1: 0 strict, 1 spaceless typing of first-tone syllables (docs/contracts/fluent-input.md).
+    func setFluency(_ level: UInt32) {
+        var out: UnsafeMutablePointer<ShanjieOutput>?
+        _ = copy(shanjie_engine_set_fluency(h, level, &out), out)
+    }
+
     func setLeftContext(_ s: String) { _ = shanjie_engine_set_left_context(h, s) }
 
     func key(_ kind: UInt32, ch: UInt32 = 0) -> Display? {
@@ -101,6 +107,7 @@ enum EngineHost {
         let code = e.loadLM(dir + "/bigram.sjlm")
         if code != 0 { log.error("shanjie_engine_load_lm failed, code \(code)"); return }
         e.setProfile(0)  // chat
+        e.setFluency(1)  // iOS interim default until fluency 2 passes (fluent-input.md section 8, question 2)
         engine = e
         log.notice("engine loaded in \(Date().timeIntervalSince(t0), format: .fixed(precision: 2), privacy: .public) s")
         Footprint.record("after_load")
