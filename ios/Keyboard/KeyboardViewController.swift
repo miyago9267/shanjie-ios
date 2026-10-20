@@ -12,6 +12,45 @@ private struct Result {
     var loaded = true
 }
 
+/// Input view that opts in to the system keyboard click sound.
+private final class ClickInputView: UIInputView, UIInputViewAudioFeedback {
+    var enableInputClicksWhenVisible: Bool { true }
+}
+
+/// Lays subviews out left to right and hides those that do not fit; no scrolling.
+private final class FitRow: UIView {
+    var gap: CGFloat = 2
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        var x: CGFloat = 0
+        for v in subviews {
+            let w = v.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize).width
+            if x + w <= bounds.width { v.frame = CGRect(x: x, y: 0, width: w, height: bounds.height); v.isHidden = false; x += w + gap }
+            else { v.isHidden = true }
+        }
+    }
+    func relayout() { setNeedsLayout() }
+}
+
+/// One reusable pop-up showing the enlarged glyph of the held key.
+private final class Callout: UILabel {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        font = .systemFont(ofSize: 34)
+        textAlignment = .center
+        textColor = .label
+        backgroundColor = UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.42, alpha: 1) : .white }
+        layer.cornerRadius = 8
+        layer.masksToBounds = false
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOpacity = 0.3
+        layer.shadowRadius = 3
+        layer.shadowOffset = CGSize(width: 0, height: 1)
+        isHidden = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+}
+
 final class KeyboardViewController: UIInputViewController {
     // Standard layout (docs/contracts/s3a.md): each key sends its ASCII keycap to the core.
     private static let rows: [[(String, Character)]] = [
@@ -25,12 +64,22 @@ final class KeyboardViewController: UIInputViewController {
     private var composing = false
     private var windowOpen = false
 
-    private let barScroll = UIScrollView()
-    private let barStack = UIStackView()
+    private let barRow = FitRow()
+    private let callout = Callout()
+    private let haptic = UIImpactFeedbackGenerator(style: .light)
     private let chevron = UIButton(type: .system)
     private lazy var globe = key("")
     private var display = Display()
     private var deleteTimer: Timer?
+
+    override func loadView() {
+        inputView = ClickInputView(frame: .zero, inputViewStyle: .keyboard)
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        if hasFullAccess { haptic.prepare() }
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -116,18 +165,18 @@ final class KeyboardViewController: UIInputViewController {
 
     private func render(_ d: Display, loading: Bool) {
         display = d
-        barStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        if loading { barStack.addArrangedSubview(chip("載入中…", nil)); chevron.isHidden = true; return }
-        if !d.preedit.isEmpty { barStack.addArrangedSubview(chip(d.preedit, #selector(commitTapped), bold: true)) }
+        barRow.subviews.forEach { $0.removeFromSuperview() }
+        if loading { barRow.addSubview(chip("載入中…", nil)); chevron.isHidden = true; barRow.relayout(); return }
+        if !d.preedit.isEmpty { barRow.addSubview(chip(d.preedit, #selector(commitTapped), bold: true)) }
         for (i, c) in d.candidates.enumerated() {
             let b = chip(c, #selector(candidateTapped(_:)), highlighted: i == d.selected)
             b.tag = i
-            barStack.addArrangedSubview(b)
+            barRow.addSubview(b)
         }
         let open = d.selected >= 0
         chevron.isHidden = d.preedit.isEmpty
         chevron.setTitle(open ? "▴" : "▾", for: .normal)
-        barScroll.setContentOffset(.zero, animated: false)
+        barRow.relayout()
     }
 
     private func chip(_ title: String, _ action: Selector?, bold: Bool = false, highlighted: Bool = false) -> UIButton {
@@ -165,27 +214,12 @@ final class KeyboardViewController: UIInputViewController {
             root.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -2),
         ])
 
-        barStack.axis = .horizontal
-        barStack.spacing = 2
-        barStack.translatesAutoresizingMaskIntoConstraints = false
-        barScroll.addSubview(barStack)
-        barScroll.showsHorizontalScrollIndicator = false
-        if #available(iOS 26.0, *) {
-            for e in [barScroll.topEdgeEffect, barScroll.bottomEdgeEffect, barScroll.leftEdgeEffect, barScroll.rightEdgeEffect] { e.isHidden = true }
-        }
         chevron.titleLabel?.font = .systemFont(ofSize: 20)
         chevron.addTarget(self, action: #selector(chevronTapped), for: .touchUpInside)
         chevron.widthAnchor.constraint(equalToConstant: 44).isActive = true
-        let bar = UIStackView(arrangedSubviews: [barScroll, chevron])
+        let bar = UIStackView(arrangedSubviews: [barRow, chevron])
         bar.heightAnchor.constraint(equalToConstant: 40).isActive = true
         root.addArrangedSubview(bar)
-        NSLayoutConstraint.activate([
-            barStack.leadingAnchor.constraint(equalTo: barScroll.contentLayoutGuide.leadingAnchor),
-            barStack.trailingAnchor.constraint(equalTo: barScroll.contentLayoutGuide.trailingAnchor),
-            barStack.topAnchor.constraint(equalTo: barScroll.contentLayoutGuide.topAnchor),
-            barStack.bottomAnchor.constraint(equalTo: barScroll.contentLayoutGuide.bottomAnchor),
-            barStack.heightAnchor.constraint(equalTo: barScroll.frameLayoutGuide.heightAnchor),
-        ])
 
         for row in Self.rows {
             let s = UIStackView()
@@ -195,6 +229,7 @@ final class KeyboardViewController: UIInputViewController {
                 let b = key(label)
                 b.tag = Int(ascii.unicodeScalars.first!.value)
                 b.addTarget(self, action: #selector(zhuyinTapped(_:)), for: .touchDown)
+                b.addTarget(self, action: #selector(showCallout(_:)), for: .touchDown)
                 s.addArrangedSubview(b)
             }
             s.heightAnchor.constraint(equalToConstant: 42).isActive = true
@@ -211,6 +246,7 @@ final class KeyboardViewController: UIInputViewController {
         back.addTarget(self, action: #selector(backUp), for: [.touchUpInside, .touchUpOutside, .touchCancel])
         let enter = key("換行")
         enter.addTarget(self, action: #selector(enterTapped), for: .touchDown)
+        for v in [globe, space, back, enter] { v.addTarget(self, action: #selector(feedback), for: .touchDown) }
         let bottom = UIStackView(arrangedSubviews: [globe, space, back, enter])
         bottom.spacing = 4
         bottom.distribution = .fill
@@ -219,19 +255,44 @@ final class KeyboardViewController: UIInputViewController {
         enter.widthAnchor.constraint(equalToConstant: 72).isActive = true
         bottom.heightAnchor.constraint(equalToConstant: 42).isActive = true
         root.addArrangedSubview(bottom)
+        view.addSubview(callout)
     }
+
+    @objc private func feedback() {
+        UIDevice.current.playInputClick()
+        if hasFullAccess { haptic.impactOccurred(); haptic.prepare() }
+    }
+
+    @objc private func showCallout(_ b: UIButton) {
+        guard let title = b.title(for: .normal) else { return }
+        callout.text = title
+        let f = b.convert(b.bounds, to: view)
+        let w = f.width + 16, h: CGFloat = 56
+        callout.frame = CGRect(x: min(max(f.midX - w / 2, 0), view.bounds.width - w), y: max(f.minY - h - 4, 0), width: w, height: h)
+        callout.isHidden = false
+    }
+
+    @objc private func hideCallout() { callout.isHidden = true }
 
     private func key(_ title: String) -> UIButton {
         let b = UIButton(type: .system)
         b.setTitle(title, for: .normal)
         b.titleLabel?.font = .systemFont(ofSize: 22)
         b.setTitleColor(.label, for: .normal)
-        b.backgroundColor = UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.36, alpha: 1) : .white }
+        b.backgroundColor = Self.keyBg
         b.layer.cornerRadius = 6
+        b.addTarget(self, action: #selector(pressDown(_:)), for: .touchDown)
+        b.addTarget(self, action: #selector(pressUp(_:)), for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
         return b
     }
 
-    @objc private func zhuyinTapped(_ b: UIButton) { send(.zhuyin(UInt32(b.tag))) }
+    private static let keyBg = UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.36, alpha: 1) : .white }
+    private static let keyBgPressed = UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.55, alpha: 1) : UIColor(white: 0.78, alpha: 1) }
+
+    @objc private func pressDown(_ b: UIButton) { b.backgroundColor = Self.keyBgPressed }
+    @objc private func pressUp(_ b: UIButton) { b.backgroundColor = Self.keyBg; hideCallout() }
+
+    @objc private func zhuyinTapped(_ b: UIButton) { feedback(); send(.zhuyin(UInt32(b.tag))) }
     @objc private func spaceTapped() { send(.space) }
     @objc private func enterTapped() { send(.enter) }
     @objc private func backDown() {
