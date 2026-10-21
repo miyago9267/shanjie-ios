@@ -160,6 +160,7 @@ final class KeyboardViewController: UIInputViewController {
 
     private func send(_ act: Act) {
         let left = display.preedit.isEmpty ? textDocumentProxy.documentContextBeforeInput : nil
+        inFlight += 1
         EngineHost.run({ [weak self] e -> Result in
             guard let self, let e else { return Result(loaded: false) }
             return self.handle(act, e, left: left)
@@ -182,7 +183,14 @@ final class KeyboardViewController: UIInputViewController {
         case .backspace:
             if composing { out = e.key(4) } else { r.deleteBackward = true }
         case .pick(let i):
+            let wasOpen = windowOpen
             out = e.pick(i)
+            // window closed: the bar tap is final, commit the whole composition like native
+            if !wasOpen, var d = out, !d.preedit.isEmpty, let c = commitAll(e) {
+                d.commit += c.commit
+                d.preedit = ""; d.candidates = []; d.selected = -1
+                out = d
+            }
         case .commitAll:
             out = commitAll(e)
         case .openCandidates:
@@ -218,10 +226,49 @@ final class KeyboardViewController: UIInputViewController {
         return (0x3105...0x312F).contains(u) || [0x2C7, 0x2CB, 0x2CA, 0x2D9].contains(u)
     }
 
+    private var hasMarked = false   // main: the proxy holds our marked preedit
+    private var inFlight = 0        // main: taps sent to the engine and not yet applied
+
+    private func clearMarked() {
+        textDocumentProxy.setMarkedText("", selectedRange: NSRange(location: 0, length: 0))
+        textDocumentProxy.unmarkText()
+        hasMarked = false
+    }
+
     private func apply(_ r: Result) {
-        if !r.insert.isEmpty { textDocumentProxy.insertText(r.insert) }
-        if r.deleteBackward { textDocumentProxy.deleteBackward() }
-        if let d = r.display { render(d, loading: false) }
+        inFlight -= 1
+        let p = textDocumentProxy
+        // clear first so the insert cannot append after the marked text
+        if hasMarked, !r.insert.isEmpty || r.display?.preedit.isEmpty == true { clearMarked() }
+        if !r.insert.isEmpty { p.insertText(r.insert) }
+        if r.deleteBackward { p.deleteBackward() }
+        if let d = r.display {
+            if !d.preedit.isEmpty {
+                p.setMarkedText(d.preedit, selectedRange: NSRange(location: d.preedit.utf16.count, length: 0))
+                hasMarked = true
+            }
+            render(d, loading: false)
+        }
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        if hasMarked || !display.preedit.isEmpty { send(.commitAll) }
+    }
+
+    // The host moved the cursor or changed the text under us: our marked preedit is no longer at the caret.
+    override func textDidChange(_ textInput: UITextInput?) {
+        super.textDidChange(textInput)
+        guard hasMarked, inFlight == 0, !display.preedit.isEmpty,
+              let before = textDocumentProxy.documentContextBeforeInput, !before.hasSuffix(display.preedit) else { return }
+        textDocumentProxy.unmarkText()
+        hasMarked = false
+        render(Display(), loading: false)
+        EngineHost.run({ [weak self] e -> Result in
+            self?.composing = false; self?.windowOpen = false; self?.pendingSyllable = false
+            _ = e?.reset(commit: false)
+            return Result()
+        }, done: { _ in })
     }
 
     // MARK: UI
@@ -230,7 +277,6 @@ final class KeyboardViewController: UIInputViewController {
         display = d
         barRow.subviews.forEach { $0.removeFromSuperview() }
         if loading { barRow.addSubview(chip("載入中…", nil)); chevron.isHidden = true; barRow.relayout(); return }
-        if !d.preedit.isEmpty { barRow.addSubview(chip(d.preedit, #selector(commitTapped), bold: true)) }
         for (i, c) in d.candidates.enumerated() {
             let b = chip(c, #selector(candidateTapped(_:)), highlighted: i == d.selected)
             b.tag = i
@@ -242,12 +288,12 @@ final class KeyboardViewController: UIInputViewController {
         barRow.relayout()
     }
 
-    private func chip(_ title: String, _ action: Selector?, bold: Bool = false, highlighted: Bool = false) -> UIButton {
+    private func chip(_ title: String, _ action: Selector?, highlighted: Bool = false) -> UIButton {
         var cfg = UIButton.Configuration.plain()
         cfg.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 10, bottom: 0, trailing: 10)
         cfg.baseForegroundColor = .label
         cfg.attributedTitle = AttributedString(title, attributes: AttributeContainer([
-            .font: UIFont.systemFont(ofSize: 20, weight: bold ? .semibold : .regular)]))
+            .font: UIFont.systemFont(ofSize: 20)]))
         let b = UIButton(configuration: cfg)
         b.backgroundColor = highlighted ? .systemBlue.withAlphaComponent(0.25) : .clear
         b.layer.cornerRadius = 6
@@ -255,7 +301,6 @@ final class KeyboardViewController: UIInputViewController {
         return b
     }
 
-    @objc private func commitTapped() { send(.commitAll) }
     @objc private func candidateTapped(_ b: UIButton) { send(.pick(b.tag)) }
     @objc private func chevronTapped() { send(display.selected >= 0 ? .closeCandidates : .openCandidates) }
 
