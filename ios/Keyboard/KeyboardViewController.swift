@@ -32,14 +32,22 @@ private final class FitRow: UIView {
     func relayout() { setNeedsLayout() }
 }
 
-/// Layout constants for the keyboard; one place for a later settings slice.
+/// Layout constants for the keyboard; `keyHeight` is user-set (36...56 pt, persisted) and the rest scale with it.
 enum KeyMetrics {
-    static var keyHeight: CGFloat = 48
-    static var rowSpacing: CGFloat = 8
-    static var keySpacing: CGFloat = 6
-    static var cornerRadius: CGFloat = 9
-    static var labelSize: CGFloat = 24
-    static var sideInset: CGFloat = 3
+    static let heightRange: ClosedRange<CGFloat> = 36...56
+    static var keyHeight: CGFloat = {
+        let v = UserDefaults.standard.double(forKey: "keyHeight")
+        return v == 0 ? 44 : min(max(CGFloat(v), heightRange.lowerBound), heightRange.upperBound)
+    }()
+    static func save() { UserDefaults.standard.set(Double(keyHeight), forKey: "keyHeight") }
+    static var rowSpacing: CGFloat { min(max((keyHeight * 0.17).rounded(), 6), 10) }
+    static let keySpacing: CGFloat = 6
+    static var cornerRadius: CGFloat { (keyHeight * 0.2).rounded() }
+    static var labelSize: CGFloat { min(max(keyHeight * 0.5, 18), 26) }
+    static let sideInset: CGFloat = 3
+    static let barHeight: CGFloat = 40
+    // top 8 + bottom 4 insets, bar + 5 key rows
+    static var totalHeight: CGFloat { 12 + barHeight + 5 * (keyHeight + rowSpacing) }
 }
 
 private final class Key: UIButton {
@@ -116,6 +124,14 @@ final class KeyboardViewController: UIInputViewController {
     private lazy var enter = key("↵")
     private let spaceHint = UILabel()
     private var bottomRow: KeyRow?
+    private let root = UIStackView()
+    private var keys: [Key] = []
+    private var rowHeights: [NSLayoutConstraint] = []
+    private var viewHeight: NSLayoutConstraint?
+    private var bar = UIStackView()
+    private let sizeStrip = UIStackView()
+    private let sizeSlider = UISlider()
+    private let sizeValue = UILabel()
     private var display = Display()
     private var deleteTimer: Timer?
 
@@ -252,12 +268,15 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func buildUI() {
-        let root = UIStackView()
         root.axis = .vertical
         root.spacing = KeyMetrics.rowSpacing
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
+        let vh = view.heightAnchor.constraint(equalToConstant: KeyMetrics.totalHeight)
+        vh.priority = UILayoutPriority(999)
+        viewHeight = vh
         NSLayoutConstraint.activate([
+            vh,
             root.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: KeyMetrics.sideInset),
             root.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -KeyMetrics.sideInset),
             root.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
@@ -267,9 +286,31 @@ final class KeyboardViewController: UIInputViewController {
         chevron.titleLabel?.font = .systemFont(ofSize: 20)
         chevron.addTarget(self, action: #selector(chevronTapped), for: .touchUpInside)
         chevron.widthAnchor.constraint(equalToConstant: 44).isActive = true
-        let bar = UIStackView(arrangedSubviews: [barRow, chevron])
-        bar.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        bar = UIStackView(arrangedSubviews: [barRow, chevron])
+        bar.heightAnchor.constraint(equalToConstant: KeyMetrics.barHeight).isActive = true
         root.addArrangedSubview(bar)
+
+        sizeSlider.minimumValue = Float(KeyMetrics.heightRange.lowerBound)
+        sizeSlider.maximumValue = Float(KeyMetrics.heightRange.upperBound)
+        sizeSlider.value = Float(KeyMetrics.keyHeight)
+        sizeSlider.addTarget(self, action: #selector(sizeChanged), for: .valueChanged)
+        sizeSlider.addTarget(self, action: #selector(sizeReleased), for: [.touchUpInside, .touchUpOutside, .touchCancel])
+        sizeValue.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        sizeValue.textColor = .secondaryLabel
+        sizeValue.text = "\(Int(KeyMetrics.keyHeight)) pt"
+        sizeValue.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        let done = UIButton(type: .system)
+        done.setTitle("完成", for: .normal)
+        done.addTarget(self, action: #selector(sizeDone), for: .touchUpInside)
+        done.widthAnchor.constraint(equalToConstant: 56).isActive = true
+        for v in [sizeSlider, sizeValue, done] { sizeStrip.addArrangedSubview(v) }
+        sizeStrip.spacing = 8
+        sizeStrip.alignment = .center
+        sizeStrip.isLayoutMarginsRelativeArrangement = true
+        sizeStrip.layoutMargins = UIEdgeInsets(top: 0, left: 12, bottom: 0, right: 4)
+        sizeStrip.isHidden = true
+        sizeStrip.heightAnchor.constraint(equalToConstant: KeyMetrics.barHeight).isActive = true
+        root.addArrangedSubview(sizeStrip)
 
         let insets: [CGFloat] = [0, 0.5, 1, 0]
         for (r, row) in Self.rows.enumerated() {
@@ -290,14 +331,15 @@ final class KeyboardViewController: UIInputViewController {
                 back.addTarget(self, action: #selector(feedback), for: .touchDown)
                 s.add(back)
             }
-            s.heightAnchor.constraint(equalToConstant: KeyMetrics.keyHeight).isActive = true
+            addRowHeight(s)
             root.addArrangedSubview(s)
         }
 
         globe.setImage(UIImage(systemName: "globe"), for: .normal)
         globe.addTarget(self, action: #selector(handleInputModeList(from:with:)), for: .allTouchEvents)
         symbols.addTarget(self, action: #selector(symbolsTapped), for: .touchDown)
-        modeKey.addTarget(self, action: #selector(modeTapped), for: .touchDown)
+        modeKey.addTarget(self, action: #selector(modeTapped), for: .touchUpInside)
+        modeKey.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(modeLongPressed(_:))))
         space.addTarget(self, action: #selector(spaceTapped), for: .touchDown)
         enter.addTarget(self, action: #selector(enterTapped), for: .touchDown)
         for v in [globe, symbols, modeKey, space, enter] { v.addTarget(self, action: #selector(feedback), for: .touchDown) }
@@ -320,7 +362,7 @@ final class KeyboardViewController: UIInputViewController {
         bottom.add(space)
         bottom.add(enter, units: 2.5)
         bottom.flexible = space
-        bottom.heightAnchor.constraint(equalToConstant: KeyMetrics.keyHeight).isActive = true
+        addRowHeight(bottom)
         self.bottomRow = bottom
         root.addArrangedSubview(bottom)
         view.addSubview(callout)
@@ -347,6 +389,40 @@ final class KeyboardViewController: UIInputViewController {
 
     @objc private func symbolsTapped() {}
 
+    private func addRowHeight(_ row: UIView) {
+        let c = row.heightAnchor.constraint(equalToConstant: KeyMetrics.keyHeight)
+        c.isActive = true
+        rowHeights.append(c)
+    }
+
+    // The long press cancels the key's touch, so touchUpInside (the tap) does not fire.
+    @objc private func modeLongPressed(_ g: UILongPressGestureRecognizer) {
+        guard g.state == .began else { return }
+        sizeSlider.value = Float(KeyMetrics.keyHeight)
+        bar.isHidden = true
+        sizeStrip.isHidden = false
+    }
+
+    @objc private func sizeChanged() {
+        let h = CGFloat(sizeSlider.value.rounded())
+        sizeSlider.value = Float(h)
+        guard h != KeyMetrics.keyHeight else { return }
+        KeyMetrics.keyHeight = h
+        sizeValue.text = "\(Int(h)) pt"
+        rowHeights.forEach { $0.constant = h }
+        root.spacing = KeyMetrics.rowSpacing
+        viewHeight?.constant = KeyMetrics.totalHeight
+        keys.forEach(style)
+    }
+
+    @objc private func sizeReleased() { KeyMetrics.save() }
+
+    @objc private func sizeDone() {
+        KeyMetrics.save()
+        sizeStrip.isHidden = true
+        bar.isHidden = false
+    }
+
     @objc private func feedback() {
         UIDevice.current.playInputClick()
         if hasFullAccess { haptic.impactOccurred(); haptic.prepare() }
@@ -370,18 +446,25 @@ final class KeyboardViewController: UIInputViewController {
         var cfg: UIButton.Configuration
         if #available(iOS 26, *) { cfg = .glass() } else { cfg = .plain(); b.backgroundColor = Self.keyBg }
         cfg.cornerStyle = .fixed
-        cfg.background.cornerRadius = KeyMetrics.cornerRadius
         cfg.contentInsets = .zero
         cfg.baseForegroundColor = .label
-        cfg.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: KeyMetrics.labelSize - 4)
-        cfg.attributedTitle = AttributedString(title, attributes: AttributeContainer([
-            .font: UIFont.systemFont(ofSize: KeyMetrics.labelSize)]))
         b.configuration = cfg
         b.layer.cornerCurve = .continuous
-        b.layer.cornerRadius = KeyMetrics.cornerRadius
+        style(b)
+        keys.append(b)
         b.addTarget(self, action: #selector(pressDown(_:)), for: .touchDown)
         b.addTarget(self, action: #selector(pressUp(_:)), for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
         return b
+    }
+
+    private func style(_ b: Key) {
+        guard var cfg = b.configuration else { return }
+        cfg.background.cornerRadius = KeyMetrics.cornerRadius
+        cfg.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: KeyMetrics.labelSize - 4)
+        cfg.attributedTitle = AttributedString(b.glyph, attributes: AttributeContainer([
+            .font: UIFont.systemFont(ofSize: KeyMetrics.labelSize)]))
+        b.configuration = cfg
+        b.layer.cornerRadius = KeyMetrics.cornerRadius
     }
 
     private static let keyBg = UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.36, alpha: 1) : .white }
