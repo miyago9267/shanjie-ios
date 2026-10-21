@@ -4,10 +4,12 @@
 
 use crate::learn::{context_key, newword_score, record_key, Learner, Level, NEWWORD_MAX, NEWWORD_MIN};
 use crate::trigram::{Bytes, Mapped, Tri, TriCtx, TriMemo};
+use crate::syllable::Raw;
 use crate::{Error, Lexicon, PER_KEY};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 pub const LAMBDA_CHAT: f64 = 0.5;
@@ -982,7 +984,7 @@ pub enum End<'a> {
 /// The last number of a word is the count of syllables it covers.
 pub type Scored<'a> = (f64, Vec<(&'a str, f64, f64, usize)>);
 
-struct Hyp<'a> {
+struct Hyp<'a, P> {
     score: f64,
     surface: String,
     words: Vec<(&'a str, f64, f64, usize)>,
@@ -992,6 +994,8 @@ struct Hyp<'a> {
     ctx: Ctx,
     /// The stored trigram context (`prev`, `last`), looked up once per hypothesis; always `None` when the table is not in use.
     tri: Option<TriCtx>,
+    /// What the caller keeps with the path (nothing for the syllable decoder, the readings and nodes for the lattice).
+    pay: P,
 }
 
 /// Learned boost (S4 §1.4, §12, §14): which records may boost is decided by `Learner::lookup` (single
@@ -1071,34 +1075,15 @@ pub fn decode_segment_learned<'a>(
     learn: Option<&Learn<'a>>,
     demote: bool,
 ) -> Result<Vec<Scored<'a>>, Error> {
-    let base = &*lex.base;
-    // New words are 2..=NEWWORD_MAX syllables and their reading may be no lexicon reading at all.
-    let fresh_on = learn.filter(|ln| ln.learner.has_new_words());
-    let max_l = if fresh_on.is_some() { base.max_len.max(NEWWORD_MAX) } else { base.max_len };
-    let cfg: Scoring = scoring.into();
-    let lam = cfg.lam;
-    let tri_on = cfg.tri && lm.tri.is_some();
+    let dec = Dec::new(lex, lm, scoring.into(), start, learn, demote);
+    let max_l = dec.max_l();
     let mut memo = TriMemo::default();
     let n = syls.len();
-    let ids = base.ids(syls);
-    let start_id = lm.word_id(start);
-    let start_prev = if start == "<s>" { start_id } else { None };
-    let before_tail: String = {
-        let t: Vec<char> = learn.map_or("", |l| l.before).chars().rev().take(crate::learn::MAX_CONTEXT).collect();
-        t.into_iter().rev().collect()
-    };
-    let mut hyps: Vec<Vec<Hyp<'a>>> = (0..=n).map(|_| Vec::new()).collect();
-    hyps[0].push(Hyp {
-        score: 0.0,
-        surface: String::new(),
-        words: Vec::new(),
-        prev: start_prev,
-        last: start_id,
-        ctx: lm.ctx_of(start_id),
-        tri: lm.tri_of(cfg, start_prev, start_id, &mut memo),
-    });
+    let ids = lex.base.ids(syls);
+    let mut hyps: Vec<Vec<Hyp<'a, ()>>> = (0..=n).map(|_| Vec::new()).collect();
+    hyps[0].push(dec.first((), &mut memo));
     for i in 1..=n {
-        let mut cand: Vec<Hyp<'a>> = Vec::new();
+        let mut cand: Vec<Hyp<'a, ()>> = Vec::new();
         // One path per (surface, last word): the next word's score depends on the last word, so a path that
         // ends in a different word must not be merged away (dec-recombine section 1). With the trigram level it depends on the last
         // two, so the previous word is part of the key too (empty without the table: the key is the old one).
@@ -1107,147 +1092,243 @@ pub fn decode_segment_learned<'a>(
             if hyps[i - l].is_empty() {
                 continue;
             }
-            let span = &syls[i - l..i];
-            let found = base.find(&ids[i - l..i]);
-            // New words of this span the lexicon lacks under it (new-word B §2.4), tried after the lexicon's entries.
-            let fresh: Vec<(&'a str, f64)> = match fresh_on {
-                Some(ln) if (NEWWORD_MIN..=NEWWORD_MAX).contains(&l) => ln
-                    .learner
-                    .new_words(span, ln.today)
-                    .into_iter()
-                    .filter(|(w, _)| found.is_none() || !base.has(span, w))
-                    .map(|(w, wt)| (w, newword_score(wt)))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            if found.is_none() && fresh.is_empty() {
-                continue;
-            }
-            let learned = learn.filter(|ln| found.is_some() && ln.learner.has_reading(span));
-            let range = found.map_or(0..0, |r| base.range(r));
-            let best = lex.ents.get(range.start).map_or(0.0, |e| e.score);
-            let dl = if demote { lex.deltas_in(&range) } else { &[] };
-            // Entries to try: the top PER_KEY, plus learned words ranked below it (`extra`: only
-            // usable on a path whose context has a learned record for them).
-            let mut entries: Vec<(usize, bool)> = range.clone().take(PER_KEY).map(|p| (p, false)).collect();
-            if let Some(ln) = learned {
-                let words = ln.learner.words_of(span);
-                let mut seen: HashSet<&str> = entries.iter().map(|&(p, _)| lex.word_of(&lex.ents[p])).collect();
-                for p in range.clone().skip(PER_KEY) {
-                    let w = lex.word_of(&lex.ents[p]);
-                    if words.binary_search(&w).is_ok() && seen.insert(w) {
-                        entries.push((p, true));
-                    }
-                }
-            }
-            // Each hypothesis's learned hits depend only on its context key, not on the entry: look
-            // them up once per hypothesis (shared by key) before trying the entries.
-            let hits_of: Vec<usize>;
-            let mut hits: Vec<(Level, Vec<(&str, f64)>)> = Vec::new();
-            if let Some(ln) = learned {
-                let mut by_ctx: HashMap<String, usize> = HashMap::new();
-                // Rule 8: at sentence start the key also holds the syllable after the word.
-                let next = syls.get(i).map(String::as_str).or(ln.after);
-                hits_of = hyps[i - l]
-                    .iter()
-                    .map(|h| {
-                        let key = record_key(context_key(&format!("{before_tail}{}", h.surface)), next);
-                        *by_ctx.entry(key).or_insert_with_key(|k| {
-                            hits.push(ln.learner.lookup(k, span, ln.today));
-                            hits.len() - 1
-                        })
-                    })
-                    .collect();
-            } else {
-                hits_of = Vec::new();
-            }
-            // Lexicon entries (`Some(position)`), then the new words (`None`: no learned boost, no demotion).
-            let items = entries.into_iter().map(|(p, extra)| (Some(p), extra, lex.word_of(&lex.ents[p]), lex.ents[p].score));
-            for (p, extra, word, lp0) in items.chain(fresh.iter().map(|&(w, lp)| (None, false, w, lp))) {
-                let (wid, pb0) = (lm.word_id(word), pow10(lp0));
-                let delta = p.and_then(|p| dl.iter().find(|&&(q, _)| q == p)).map_or(0.0, |x| x.1);
-                for (hi, h) in hyps[i - l].iter().enumerate() {
-                    let (mut lp, mut pb, mut was_boosted) = (lp0, pb0, false);
-                    if let Some(ln) = learned.filter(|_| p.is_some()) {
-                        let (lv, ws) = &hits[hits_of[hi]];
-                        let eps = if *lv == Level::Global { ln.eps_global } else { LEARN_EPS };
-                        // eps 0 switches the level off, for `extra` entries too: `best + 0` would
-                        // still lift a word to a tie with the top.
-                        match ws.iter().find(|(w, _)| *w == word) {
-                            Some(&(_, w)) if eps > 0.0 => {
-                                let boosted = best + eps * (w / (w + 1.0));
-                                if boosted > lp {
-                                    lp = boosted;
-                                    pb = pow10(lp);
-                                    was_boosted = true;
-                                }
-                            }
-                            _ if extra => continue,
-                            _ => {}
-                        }
-                    }
-                    // model-v6 section 2.8 rule 1: a boosted entry skips the Kneser-Ney substitution (its boosted pb would be replaced
-                    // by N'/sum(N') and the boost would shrink to the (1 - lam) * lp part); every other entry is scored as before.
-                    let prob = if was_boosted { lm.prob_learned(h.ctx, wid, pb) } else { lm.prob_tri(h.tri, h.ctx, wid, pb, cfg.kn) };
-                    let sc = h.score + (word_term(lam, prob, lp) - delta);
-                    let before = if tri_on { h.words.last().map_or(start, |w| w.0) } else { "" };
-                    let key = (format!("{}{word}", h.surface), before, word);
-                    match idx.get(&key).copied() {
-                        Some(q) if !(sc > cand[q].score) => {}
-                        found => {
-                            let mut words = h.words.clone();
-                            words.push((word, lp, delta, l));
-                            // The surface is cloned only for a new slot (the index keeps one copy); a replacement moves it.
-                            let surface = match found {
-                                Some(_) => key.0,
-                                None => {
-                                    let s = key.0.clone();
-                                    idx.insert(key, cand.len());
-                                    s
-                                }
-                            };
-                            let nh = Hyp { score: sc, surface, words, prev: h.last, last: wid, ctx: lm.ctx_of(None), tri: None };
-                            match found {
-                                Some(q) => cand[q] = nh,
-                                None => cand.push(nh),
-                            }
-                        }
-                    }
-                }
-            }
+            let found = lex.base.find(&ids[i - l..i]);
+            let next = syls.get(i).map(String::as_str).or(learn.and_then(|ln| ln.after));
+            dec.extend(&hyps[i - l], &syls[i - l..i], found, next, l, &|_| (), &mut cand, &mut idx);
         }
-        cand.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        cand.truncate(beam);
-        for h in &mut cand {
-            h.ctx = lm.ctx_of(h.last);
-            h.tri = lm.tri_of(cfg, h.prev, h.last, &mut memo);
-        }
-        hyps[i] = cand;
+        hyps[i] = dec.settle(cand, beam, &mut memo);
     }
     let last = std::mem::take(&mut hyps[n]);
-    let closing = match end {
-        End::Eos => None,
-        End::Next { word, lp, delta } => Some((lm.word_id(word), pow10(lp), lp, delta)),
-    };
-    let mut out: Vec<(f64, Vec<(&'a str, f64, f64, usize)>, String)> = last
-        .into_iter()
-        .map(|h| {
-            // (b') a one-word segment from an unknown start closes without the table.
-            let tri = if start != "<s>" && h.words.len() == 1 { None } else { h.tri };
-            let term = match closing {
-                None => lam * lm.prob_tri(tri, h.ctx, Some(1), lm.p_eos, cfg.kn).log10(),
-                Some((wid, pb, lp, delta)) => word_term(lam, lm.prob_tri(tri, h.ctx, wid, pb, cfg.kn), lp) - delta,
-            };
-            (h.score + term, h.words, h.surface)
-        })
-        .collect();
+    let out = dec.close(last, end);
     if out.is_empty() {
         return Err(Error::NoPath { len: n });
     }
-    out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    // The n-best has distinct surfaces: keep each surface's best path (dec-recombine section 1.4).
-    let mut seen: HashSet<String> = HashSet::new();
-    Ok(out.into_iter().filter_map(|(sc, ws, s)| seen.insert(s).then_some((sc, ws))).collect())
+    Ok(out.into_iter().map(|(sc, h)| (sc, h.words)).collect())
+}
+
+/// What the two decoders share (the syllable decoder `decode_segment_learned` and the lattice decoder `decode_lattice`): the
+/// setting of one decode, and the three steps of it that do not depend on how positions and spans are found: `extend` (the words
+/// of one span, scored, learned, demoted, recombined onto the paths that reach its start), `settle` (the beam of one position) and
+/// `close` (the closing term and the n-best). The arithmetic is the syllable decoder's, moved here unchanged.
+struct Dec<'a, 'b> {
+    lex: &'a CappedLexicon,
+    lm: &'b Lm,
+    cfg: Scoring,
+    lam: f64,
+    tri_on: bool,
+    learn: Option<&'b Learn<'a>>,
+    /// The learner when it holds new words: those are enumerated on spans too.
+    fresh_on: Option<&'b Learn<'a>>,
+    demote: bool,
+    start: &'b str,
+    before_tail: String,
+}
+
+impl<'a, 'b> Dec<'a, 'b> {
+    fn new(lex: &'a CappedLexicon, lm: &'b Lm, cfg: Scoring, start: &'b str, learn: Option<&'b Learn<'a>>, demote: bool) -> Dec<'a, 'b> {
+        let before_tail: String = {
+            let t: Vec<char> = learn.map_or("", |l| l.before).chars().rev().take(crate::learn::MAX_CONTEXT).collect();
+            t.into_iter().rev().collect()
+        };
+        Dec {
+            lex,
+            lm,
+            cfg,
+            lam: cfg.lam,
+            tri_on: cfg.tri && lm.tri.is_some(),
+            learn,
+            fresh_on: learn.filter(|ln| ln.learner.has_new_words()),
+            demote,
+            start,
+            before_tail,
+        }
+    }
+
+    /// New words are 2..=NEWWORD_MAX syllables and their reading may be no lexicon reading at all.
+    fn max_l(&self) -> usize {
+        if self.fresh_on.is_some() { self.lex.base.max_len.max(NEWWORD_MAX) } else { self.lex.base.max_len }
+    }
+
+    /// The path that holds nothing yet, standing on the word before the segment.
+    fn first<P>(&self, pay: P, memo: &mut TriMemo) -> Hyp<'a, P> {
+        let start_id = self.lm.word_id(self.start);
+        let start_prev = if self.start == "<s>" { start_id } else { None };
+        Hyp {
+            score: 0.0,
+            surface: String::new(),
+            words: Vec::new(),
+            prev: start_prev,
+            last: start_id,
+            ctx: self.lm.ctx_of(start_id),
+            tri: self.lm.tri_of(self.cfg, start_prev, start_id, memo),
+            pay,
+        }
+    }
+
+    /// The words that span `span` (`found`: its reading in the lexicon) added to every path of `from`, the paths that reach the span's
+    /// start, into the candidates `cand` of the span's end. `next` is the syllable right of the span when known (rule 8). `grow` makes
+    /// the payload of a new path from its parent's. `span` is only read when a learner is present (the lattice decoder passes `&[]`
+    /// otherwise); `l` is the word's length in syllables.
+    #[allow(clippy::too_many_arguments)]
+    fn extend<'k, P: Clone>(
+        &self,
+        from: &[Hyp<'a, P>],
+        span: &[String],
+        found: Option<usize>,
+        next: Option<&str>,
+        l: usize,
+        grow: &dyn Fn(&P) -> P,
+        cand: &mut Vec<Hyp<'a, P>>,
+        idx: &mut HashMap<(String, &'k str, &'k str), usize>,
+    ) where
+        'a: 'k,
+        'b: 'k,
+    {
+        let (lex, lm, cfg, lam, tri_on, demote, start) = (self.lex, self.lm, self.cfg, self.lam, self.tri_on, self.demote, self.start);
+        let base = &*lex.base;
+        // New words of this span the lexicon lacks under it (new-word B §2.4), tried after the lexicon's entries.
+        let fresh: Vec<(&'a str, f64)> = match self.fresh_on {
+            Some(ln) if (NEWWORD_MIN..=NEWWORD_MAX).contains(&l) => ln
+                .learner
+                .new_words(span, ln.today)
+                .into_iter()
+                .filter(|(w, _)| found.is_none() || !base.has(span, w))
+                .map(|(w, wt)| (w, newword_score(wt)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if found.is_none() && fresh.is_empty() {
+            return;
+        }
+        let learned = self.learn.filter(|ln| found.is_some() && ln.learner.has_reading(span));
+        let range = found.map_or(0..0, |r| base.range(r));
+        let best = lex.ents.get(range.start).map_or(0.0, |e| e.score);
+        let dl = if demote { lex.deltas_in(&range) } else { &[] };
+        // Entries to try: the top PER_KEY, plus learned words ranked below it (`extra`: only
+        // usable on a path whose context has a learned record for them).
+        let mut entries: Vec<(usize, bool)> = range.clone().take(PER_KEY).map(|p| (p, false)).collect();
+        if let Some(ln) = learned {
+            let words = ln.learner.words_of(span);
+            let mut seen: HashSet<&str> = entries.iter().map(|&(p, _)| lex.word_of(&lex.ents[p])).collect();
+            for p in range.clone().skip(PER_KEY) {
+                let w = lex.word_of(&lex.ents[p]);
+                if words.binary_search(&w).is_ok() && seen.insert(w) {
+                    entries.push((p, true));
+                }
+            }
+        }
+        // Each hypothesis's learned hits depend only on its context key, not on the entry: look
+        // them up once per hypothesis (shared by key) before trying the entries.
+        let hits_of: Vec<usize>;
+        let mut hits: Vec<(Level, Vec<(&str, f64)>)> = Vec::new();
+        if let Some(ln) = learned {
+            let mut by_ctx: HashMap<String, usize> = HashMap::new();
+            // Rule 8: at sentence start the key also holds the syllable after the word.
+            hits_of = from
+                .iter()
+                .map(|h| {
+                    let key = record_key(context_key(&format!("{}{}", self.before_tail, h.surface)), next);
+                    *by_ctx.entry(key).or_insert_with_key(|k| {
+                        hits.push(ln.learner.lookup(k, span, ln.today));
+                        hits.len() - 1
+                    })
+                })
+                .collect();
+        } else {
+            hits_of = Vec::new();
+        }
+        // Lexicon entries (`Some(position)`), then the new words (`None`: no learned boost, no demotion).
+        let items = entries.into_iter().map(|(p, extra)| (Some(p), extra, lex.word_of(&lex.ents[p]), lex.ents[p].score));
+        for (p, extra, word, lp0) in items.chain(fresh.iter().map(|&(w, lp)| (None, false, w, lp))) {
+            let (wid, pb0) = (lm.word_id(word), pow10(lp0));
+            let delta = p.and_then(|p| dl.iter().find(|&&(q, _)| q == p)).map_or(0.0, |x| x.1);
+            for (hi, h) in from.iter().enumerate() {
+                let (mut lp, mut pb, mut was_boosted) = (lp0, pb0, false);
+                if let Some(ln) = learned.filter(|_| p.is_some()) {
+                    let (lv, ws) = &hits[hits_of[hi]];
+                    let eps = if *lv == Level::Global { ln.eps_global } else { LEARN_EPS };
+                    // eps 0 switches the level off, for `extra` entries too: `best + 0` would
+                    // still lift a word to a tie with the top.
+                    match ws.iter().find(|(w, _)| *w == word) {
+                        Some(&(_, w)) if eps > 0.0 => {
+                            let boosted = best + eps * (w / (w + 1.0));
+                            if boosted > lp {
+                                lp = boosted;
+                                pb = pow10(lp);
+                                was_boosted = true;
+                            }
+                        }
+                        _ if extra => continue,
+                        _ => {}
+                    }
+                }
+                // model-v6 section 2.8 rule 1: a boosted entry skips the Kneser-Ney substitution (its boosted pb would be replaced
+                // by N'/sum(N') and the boost would shrink to the (1 - lam) * lp part); every other entry is scored as before.
+                let prob = if was_boosted { lm.prob_learned(h.ctx, wid, pb) } else { lm.prob_tri(h.tri, h.ctx, wid, pb, cfg.kn) };
+                let sc = h.score + (word_term(lam, prob, lp) - delta);
+                let before = if tri_on { h.words.last().map_or(start, |w| w.0) } else { "" };
+                let key = (format!("{}{word}", h.surface), before, word);
+                match idx.get(&key).copied() {
+                    Some(q) if !(sc > cand[q].score) => {}
+                    found => {
+                        let mut words = h.words.clone();
+                        words.push((word, lp, delta, l));
+                        // The surface is cloned only for a new slot (the index keeps one copy); a replacement moves it.
+                        let surface = match found {
+                            Some(_) => key.0,
+                            None => {
+                                let s = key.0.clone();
+                                idx.insert(key, cand.len());
+                                s
+                            }
+                        };
+                        let nh = Hyp { score: sc, surface, words, prev: h.last, last: wid, ctx: lm.ctx_of(None), tri: None, pay: grow(&h.pay) };
+                        match found {
+                            Some(q) => cand[q] = nh,
+                            None => cand.push(nh),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The beam of one position: best first (stable), cut to `beam`, the model's context set on what stays.
+    fn settle<P>(&self, mut cand: Vec<Hyp<'a, P>>, beam: usize, memo: &mut TriMemo) -> Vec<Hyp<'a, P>> {
+        cand.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        cand.truncate(beam);
+        for h in &mut cand {
+            h.ctx = self.lm.ctx_of(h.last);
+            h.tri = self.lm.tri_of(self.cfg, h.prev, h.last, memo);
+        }
+        cand
+    }
+
+    /// The paths that cover the whole segment with the closing term added, best first, one per surface (dec-recombine section 1.4).
+    fn close<P>(&self, last: Vec<Hyp<'a, P>>, end: End<'_>) -> Vec<(f64, Hyp<'a, P>)> {
+        let (lm, cfg, lam) = (self.lm, self.cfg, self.lam);
+        let closing = match end {
+            End::Eos => None,
+            End::Next { word, lp, delta } => Some((lm.word_id(word), pow10(lp), lp, delta)),
+        };
+        let mut out: Vec<(f64, Hyp<'a, P>)> = last
+            .into_iter()
+            .map(|h| {
+                // (b') a one-word segment from an unknown start closes without the table.
+                let tri = if self.start != "<s>" && h.words.len() == 1 { None } else { h.tri };
+                let term = match closing {
+                    None => lam * lm.prob_tri(tri, h.ctx, Some(1), lm.p_eos, cfg.kn).log10(),
+                    Some((wid, pb, lp, delta)) => word_term(lam, lm.prob_tri(tri, h.ctx, wid, pb, cfg.kn), lp) - delta,
+                };
+                (h.score + term, h)
+            })
+            .collect();
+        out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // The n-best has distinct surfaces: keep each surface's best path.
+        let mut seen: HashSet<String> = HashSet::new();
+        out.retain(|(_, h)| seen.insert(h.surface.clone()));
+        out
+    }
 }
 
 /// S2h §1: the word that conditions the first word of a composition with no fixed word on its left.
@@ -1289,6 +1370,223 @@ pub fn decode_from(
         .into_iter()
         .map(|(s, ws)| (s, ws.into_iter().map(|(w, ..)| w.to_string()).collect()))
         .collect())
+}
+
+/// One word of a lattice path: the word, the lp and demotion it was scored with, its reading (the lexicon's syllable names, tone
+/// mark included: this is what an untyped tone was resolved to) and the node after each of its syllables.
+pub struct LWord<'a> {
+    pub word: &'a str,
+    pub lp: f64,
+    pub delta: f64,
+    pub reading: Vec<&'a str>,
+    pub ends: Vec<usize>,
+}
+
+/// A lattice path: total score and its words in order.
+pub struct LPath<'a> {
+    pub score: f64,
+    pub words: Vec<LWord<'a>>,
+}
+
+impl LPath<'_> {
+    pub fn surface(&self) -> String {
+        self.words.iter().map(|w| w.word).collect()
+    }
+
+    /// Every syllable of the path in order: its lexicon name and the node after it.
+    pub fn syllables(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+        self.words.iter().flat_map(|w| w.reading.iter().copied().zip(w.ends.iter().copied()))
+    }
+}
+
+/// What `decode_lattice` found: the paths that cover every node, best first (empty when none does), the best path to the furthest node
+/// that any path reaches (only when nothing covers; it holds no closing term), and the number of edges of the lattice.
+pub struct LatticeOut<'a> {
+    pub full: Vec<LPath<'a>>,
+    pub prefix: Option<LPath<'a>>,
+    pub edges: usize,
+}
+
+/// The settings of a lattice decode: scoring (from `Lm::scoring`), the word before the segment, the beam, the demotion table on or off.
+pub struct LatticeCfg<'a> {
+    pub scoring: Scoring,
+    pub start: &'a str,
+    pub beam: usize,
+    pub demote: bool,
+}
+
+/// The tail window of the contract (fluent-input section 3): a tail longer than `TAIL_MAX` symbols is cut back to at least `TAIL_KEEP`.
+pub const TAIL_MAX: usize = 36;
+pub const TAIL_KEEP: usize = 12;
+
+/// How a path got to a hypothesis: the lexicon reading of each word and the node after each of its syllables, newest word first.
+struct PNode {
+    prev: Option<Rc<PNode>>,
+    reading: u32,
+    ends: Rc<[u32]>,
+}
+
+type Pay = Option<Rc<PNode>>;
+
+/// A word found from node `from` along lattice edges: its lexicon reading and the node after each syllable.
+struct Found {
+    from: usize,
+    reading: usize,
+    ends: Rc<[u32]>,
+}
+
+/// Depth-first walk over the lattice edges from one node, matching the toneless index.
+struct Walk<'x> {
+    lex: &'x Lexicon,
+    tl: &'x crate::Tl,
+    edges: &'x [Vec<crate::syllable::Edge>],
+    max_len: usize,
+}
+
+impl Walk<'_> {
+    /// `[lo, hi)` are the positions of `tl.index` whose toneless key starts with the `d` syllables chosen so far; `tones[k]` is the
+    /// tone the k-th of them is bound to. A reading of exactly `d + 1` syllables that fits the tones is a word ending at the node after the
+    /// edge; longer ones go on.
+    #[allow(clippy::too_many_arguments)]
+    fn go(&self, from: usize, node: usize, d: usize, (lo, hi): (usize, usize), tones: &mut Vec<Option<u8>>, ends: &mut Vec<u32>, out: &mut [Vec<Found>]) {
+        let (lex, tl) = (self.lex, self.tl);
+        let len_of = |r: u32| lex.readings[r as usize].key_len as usize;
+        // Readings of exactly `d` syllables come first in the range: this edge does not extend them.
+        let s = lo + tl.index[lo..hi].partition_point(|&r| len_of(r) == d);
+        for e in &self.edges[node] {
+            let a = s + tl.index[s..hi].partition_point(|&r| key_tl(lex, tl, r, d) < e.tl);
+            let b = s + tl.index[s..hi].partition_point(|&r| key_tl(lex, tl, r, d) <= e.tl);
+            if a >= b {
+                continue;
+            }
+            tones.push(e.tone);
+            ends.push(e.to);
+            // Of the readings with exactly d + 1 syllables (first in [a, b)) the ones whose tones fit are words.
+            let c = a + tl.index[a..b].partition_point(|&r| len_of(r) == d + 1);
+            let mut shared: Option<Rc<[u32]>> = None;
+            for &r in &tl.index[a..c] {
+                let key = lex.key_of(&lex.readings[r as usize]);
+                if tones.iter().zip(key).all(|(t, &s)| t.is_none_or(|t| tl.tone_of[s as usize] == t)) {
+                    let ends = shared.get_or_insert_with(|| ends.as_slice().into()).clone();
+                    out[e.to as usize].push(Found { from, reading: r as usize, ends });
+                }
+            }
+            if c < b && d + 1 < self.max_len {
+                self.go(from, e.to as usize, d + 1, (a, b), tones, ends, out);
+            }
+            tones.pop();
+            ends.pop();
+        }
+    }
+}
+
+/// The k-th toneless id of reading `r` (positions are never beyond the key: callers only ask inside a range of longer readings).
+fn key_tl(lex: &Lexicon, tl: &crate::Tl, r: u32, k: usize) -> u32 {
+    tl.tl_of[lex.key_of(&lex.readings[r as usize])[k] as usize]
+}
+
+/// Contract fluent-input section 3, R2: the lattice decoder. `raw` is what was typed (`syllable::Raw`); its edges are those of
+/// `syllable::lattice_edges`, and a word is a lexicon reading found through the lexicon's toneless index along a chain of edges, with
+/// the tones of the edges that carry one. Scored by the same inner loop as `decode_segment_learned` (`Dec::extend`): the words'
+/// lp, lambda, Kneser-Ney, bigram (and trigram when the scoring has it), demotion; no penalty for a tone. A word reads as the reading it
+/// matched, so an untyped tone is whichever tone the best word has. With `learn`, learned boosts and new words are looked up under that
+/// actual reading; a new word whose reading is no lexicon reading at all is not tried (the lattice only walks lexicon readings), and
+/// rule 8's next syllable is known only when a finalized syllable (`Raw::Syl`) follows or the word ends the segment (`learn.after`).
+pub fn decode_lattice<'a>(lex: &'a CappedLexicon, raw: &[Raw], lm: &Lm, cfg: &LatticeCfg, end: End<'_>, learn: Option<&Learn<'a>>) -> LatticeOut<'a> {
+    let base = &*lex.base;
+    let tl = base.tl();
+    let edges = crate::syllable::lattice_edges(raw, base);
+    let n_edges = edges.iter().map(Vec::len).sum();
+    let dec = Dec::new(lex, lm, cfg.scoring, cfg.start, learn, cfg.demote);
+    let walk = Walk { lex: base, tl, edges: &edges, max_len: base.max_len };
+    let m = raw.len();
+    let mut memo = TriMemo::default();
+    let mut hyps: Vec<Vec<Hyp<'a, Pay>>> = (0..=m).map(|_| Vec::new()).collect();
+    let mut pending: Vec<Vec<Found>> = (0..=m).map(|_| Vec::new()).collect();
+    for i in 0..=m {
+        if i == 0 {
+            hyps[0].push(dec.first(None, &mut memo));
+        } else {
+            let mut found = std::mem::take(&mut pending[i]);
+            // The syllable decoder tries the longest source last (l = 1 first): the same order here, so ties break the same way.
+            found.sort_by_key(|f| std::cmp::Reverse(f.from));
+            let mut cand: Vec<Hyp<'a, Pay>> = Vec::new();
+            let mut idx: HashMap<(String, &str, &str), usize> = HashMap::new();
+            for f in &found {
+                if hyps[f.from].is_empty() {
+                    continue;
+                }
+                let r = f.reading;
+                let names: Vec<String> = if learn.is_some() {
+                    base.key_of(&base.readings[r]).iter().map(|&s| base.syl_names[s as usize].clone()).collect()
+                } else {
+                    Vec::new()
+                };
+                let l = f.ends.len();
+                let next = match raw.get(i) {
+                    Some(Raw::Syl(s)) => Some(s.as_str()),
+                    Some(_) => None,
+                    None => learn.and_then(|ln| ln.after),
+                };
+                let grow = |p: &Pay| Some(Rc::new(PNode { prev: p.clone(), reading: r as u32, ends: f.ends.clone() }));
+                dec.extend(&hyps[f.from], &names, Some(r), next, l, &grow, &mut cand, &mut idx);
+            }
+            hyps[i] = dec.settle(cand, cfg.beam, &mut memo);
+        }
+        if i < m && !hyps[i].is_empty() {
+            walk.go(i, i, 0, (0, tl.index.len()), &mut Vec::new(), &mut Vec::new(), &mut pending);
+        }
+    }
+    let to_path = |sc: f64, h: &Hyp<'a, Pay>| -> LPath<'a> {
+        let mut nodes = Vec::new();
+        let mut at = h.pay.as_ref();
+        while let Some(nd) = at {
+            nodes.push(nd);
+            at = nd.prev.as_ref();
+        }
+        let words = h
+            .words
+            .iter()
+            .zip(nodes.iter().rev())
+            .map(|(&(word, lp, delta, _), nd)| LWord {
+                word,
+                lp,
+                delta,
+                reading: base.key_of(&base.readings[nd.reading as usize]).iter().map(|&s| base.syl_names[s as usize].as_str()).collect(),
+                ends: nd.ends.iter().map(|&e| e as usize).collect(),
+            })
+            .collect();
+        LPath { score: sc, words }
+    };
+    let last = std::mem::take(&mut hyps[m]);
+    let full: Vec<LPath<'a>> = dec.close(last, end).iter().map(|(sc, h)| to_path(*sc, h)).collect();
+    let prefix = if full.is_empty() {
+        (1..m).rev().find(|&i| !hyps[i].is_empty()).map(|i| to_path(hyps[i][0].score, &hyps[i][0]))
+    } else {
+        None
+    };
+    LatticeOut { full, prefix, edges: n_edges }
+}
+
+/// Contract fluent-input section 3 (the tail window): once the tail holds more than `TAIL_MAX` symbols (symbol and tone keys count 1
+/// each), take the best path of `finalized` plus the tail (the full-cover path when there is one, else the best prefix path), cut at the
+/// largest syllable boundary b that leaves at least `TAIL_KEEP` symbols, and return the syllables before it (named by the path's
+/// words, an untyped tone as the word reads) and the tail that remains. A tail of at most `TAIL_MAX`, or one with no such boundary,
+/// comes back unchanged with no syllable. Pure: no engine state; the engine and the offline tools both call this one function.
+/// `finalized` are syllables already decided (name with tone mark, none for the first tone).
+pub fn finalize_tail(finalized: &[String], tail: &[Raw], lm: &Lm, lex: &CappedLexicon, cfg: &LatticeCfg) -> (Vec<String>, Vec<Raw>) {
+    let unchanged = || (Vec::new(), tail.to_vec());
+    if tail.len() <= TAIL_MAX {
+        return unchanged();
+    }
+    let f = finalized.len();
+    let raw: Vec<Raw> = finalized.iter().map(|s| Raw::Syl(s.clone())).chain(tail.iter().cloned()).collect();
+    let out = decode_lattice(lex, &raw, lm, cfg, End::Eos, None);
+    let Some(path) = out.full.first().or(out.prefix.as_ref()) else { return unchanged() };
+    // Boundaries in tail symbols; the finalized syllables each take one node, so nodes before `f` are theirs.
+    let sylls: Vec<(&str, usize)> = path.syllables().filter(|&(_, e)| e > f).map(|(s, e)| (s, e - f)).collect();
+    let Some(b) = sylls.iter().map(|&(_, e)| e).filter(|&e| tail.len() - e.min(tail.len()) >= TAIL_KEEP).max() else { return unchanged() };
+    (sylls.iter().take_while(|&&(_, e)| e <= b).map(|&(s, _)| s.to_string()).collect(), tail[b..].to_vec())
 }
 
 #[cfg(test)]
@@ -1876,5 +2174,114 @@ mod tests {
         std::fs::create_dir(&t).unwrap();
         assert_eq!(Lm::load_opts(&m, false, true, true).err(), Some(LmError::TriTable), "directory");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- the lattice decoder (fluent-input contract section 3, R2) ----
+
+    /// A model with every word seen twice and no bigram, so the lexicon's lp decides, and the lexicon of `text`.
+    fn lattice_setup(text: &str, vocab: &[&str]) -> (Lm, CappedLexicon) {
+        let mut sorted = vocab.to_vec();
+        sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut words = vec!["<s>", "</s>"];
+        words.extend(sorted);
+        let mut uni = vec![0, 0];
+        uni.extend(vocab.iter().map(|_| 2u64));
+        let lm = Lm::parse(&lm_bytes(&words, &uni, &[])).unwrap();
+        let lex = Arc::new(Lexicon::parse(text).unwrap());
+        let capped = CappedLexicon::new(lex, "", &lm, Some(&Demote::parse("").unwrap())).unwrap();
+        (lm, capped)
+    }
+
+    fn typed(s: &str) -> Vec<Raw> {
+        s.chars().map(|c| if "ˊˇˋ˙".contains(c) { Raw::Tone(c) } else { Raw::Sym(c) }).collect()
+    }
+
+    fn best<'a>(lm: &Lm, lex: &'a CappedLexicon, raw: &[Raw]) -> LPath<'a> {
+        let cfg = LatticeCfg { scoring: lm.scoring(Profile::Chat), start: "<s>", beam: 64, demote: true };
+        decode_lattice(lex, raw, lm, &cfg, End::Eos, None).full.swap_remove(0)
+    }
+
+    /// Rule 1 of R2: with every syllable given (`Raw::Syl`, the tone too) the lattice is the syllable decoder: same words, same score
+    /// to the last bit (the two share the inner loop).
+    #[test]
+    fn given_syllables_decode_exactly_as_the_syllable_decoder() {
+        let words = ["下", "下來", "來", "分析"];
+        let (lm, capped) = lattice_setup("ㄒㄧㄚˋ 下 -1.0\nㄌㄞˊ 來 -1.0\nㄒㄧㄚˋ-ㄌㄞˊ 下來 -0.5\nㄈㄣ-ㄒㄧ 分析 -3.0\n", &words);
+        let syls: Vec<String> = ["ㄒㄧㄚˋ", "ㄌㄞˊ", "ㄈㄣ", "ㄒㄧ"].iter().map(|s| s.to_string()).collect();
+        let raw: Vec<Raw> = syls.iter().cloned().map(Raw::Syl).collect();
+        let want = decode_segment_learned(&capped, &syls, &lm, 0.5, "<s>", End::Eos, 64, None, true).unwrap();
+        let cfg = LatticeCfg { scoring: lm.scoring(Profile::Chat), start: "<s>", beam: 64, demote: true };
+        let got = decode_lattice(&capped, &raw, &lm, &cfg, End::Eos, None).full;
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(g.score.to_bits(), w.0.to_bits());
+            assert_eq!(g.words.iter().map(|x| x.word).collect::<Vec<_>>(), w.1.iter().map(|x| x.0).collect::<Vec<_>>());
+        }
+    }
+
+    /// ㄒㄧㄢ with no tone is one syllable (先) or two (西 + 安), and the words around decide: alone, 西安 is the likelier word; before ㄕㄥ,
+    /// 先生 beats 西安 + 生.
+    #[test]
+    fn segmentation_of_an_ambiguous_run_follows_the_words() {
+        let text = "ㄒㄧㄢ 先 -1.5\nㄒㄧ 西 -1.0\nㄢ 安 -1.0\nㄒㄧ-ㄢ 西安 -0.3\nㄕㄥ 生 -1.0\nㄒㄧㄢ-ㄕㄥ 先生 -0.5\n";
+        let (lm, capped) = lattice_setup(text, &["先", "西", "安", "西安", "生", "先生"]);
+        let alone = best(&lm, &capped, &typed("ㄒㄧㄢ"));
+        assert_eq!(alone.surface(), "西安");
+        assert_eq!(alone.syllables().collect::<Vec<_>>(), [("ㄒㄧ", 2), ("ㄢ", 3)]);
+        let before = best(&lm, &capped, &typed("ㄒㄧㄢㄕㄥ"));
+        assert_eq!(before.surface(), "先生");
+        assert_eq!(before.syllables().collect::<Vec<_>>(), [("ㄒㄧㄢ", 3), ("ㄕㄥ", 5)]);
+        // Symbols in any order inside a syllable: ㄢ ㄧ ㄒ is the same one syllable.
+        assert_eq!(best(&lm, &capped, &typed("ㄢㄧㄒㄕㄥ")).surface(), "先生");
+    }
+
+    /// A tone key binds only its own syllable; an untyped syllable takes any tone, the first and the fifth (˙) included.
+    #[test]
+    fn a_tone_key_binds_one_syllable_and_an_untyped_one_takes_any_tone() {
+        let text = "ㄒㄧˇ 洗 -0.5\nㄒㄧˊ 習 -2.0\nㄒㄧ 西 -1.0\nㄒㄧ˙ 惜 -3.0\nㄇㄚ˙ 嗎 -0.2\nㄇㄚˇ 馬 -1.0\n";
+        let (lm, capped) = lattice_setup(text, &["洗", "習", "西", "惜", "嗎", "馬"]);
+        assert_eq!(best(&lm, &capped, &typed("ㄒㄧ")).surface(), "洗", "no tone typed: the likeliest tone wins");
+        assert_eq!(best(&lm, &capped, &typed("ㄒㄧˊ")).surface(), "習", "ˊ binds the syllable to the second tone");
+        let p = best(&lm, &capped, &typed("ㄇㄚ"));
+        assert_eq!((p.surface().as_str(), p.syllables().next().unwrap().0), ("嗎", "ㄇㄚ˙"), "the fifth tone is a tone too");
+        // The tone of the first syllable does not bind the second.
+        assert_eq!(best(&lm, &capped, &typed("ㄒㄧˊㄇㄚ")).surface(), "習嗎");
+        assert_eq!(best(&lm, &capped, &typed("ㄒㄧㄇㄚˇ")).surface(), "洗馬");
+    }
+
+    /// The first tone has no key: only the lattice's own words matter, and a first-tone-only syllable is reachable untyped.
+    #[test]
+    fn nothing_covers_a_tone_key_without_a_syllable_before_it() {
+        let (lm, capped) = lattice_setup("ㄒㄧ 西 -1.0\n", &["西"]);
+        let cfg = LatticeCfg { scoring: lm.scoring(Profile::Chat), start: "<s>", beam: 64, demote: true };
+        for s in ["ˇㄒㄧ", "ㄒㄧˇˇ", "ㄒㄧˇ"] {
+            assert!(decode_lattice(&capped, &typed(s), &lm, &cfg, End::Eos, None).full.is_empty(), "{s}");
+        }
+        let out = decode_lattice(&capped, &typed("ㄒㄧㄅ"), &lm, &cfg, End::Eos, None);
+        assert!(out.full.is_empty());
+        assert_eq!(out.prefix.unwrap().surface(), "西", "a trailing symbol that is no syllable leaves the best prefix path");
+    }
+
+    /// The tail window: at most 36 symbols stay as they are; one more and the part before the largest syllable boundary that leaves
+    /// 12 symbols is decided, named by the path (an untyped tone as the best word reads it).
+    #[test]
+    fn finalize_tail_cuts_the_window_from_36_to_12() {
+        let (lm, capped) = lattice_setup("ㄅㄚ 八 -1.0\nㄅㄚˊ 拔 -0.5\n", &["八", "拔"]);
+        let cfg = LatticeCfg { scoring: lm.scoring(Profile::Chat), start: "<s>", beam: 64, demote: true };
+        let tail36: Vec<Raw> = typed(&"ㄅㄚ".repeat(18));
+        let (done, rest) = finalize_tail(&[], &tail36, &lm, &capped, &cfg);
+        assert!(done.is_empty() && rest == tail36, "36 symbols are not cut");
+        let tail40 = typed(&"ㄅㄚ".repeat(20));
+        let (done, rest) = finalize_tail(&[], &tail40, &lm, &capped, &cfg);
+        assert_eq!(rest, typed(&"ㄅㄚ".repeat(6)), "12 symbols stay");
+        assert_eq!(done, vec!["ㄅㄚˊ".to_string(); 14], "the 28 symbols before them are 14 syllables, read with the tone the path chose");
+        // Tone keys count as symbols and close their syllable: 12 x (2 symbols + a tone) = 36, one more symbol = 37.
+        let mut t37 = typed(&"ㄅㄚˋ".repeat(12));
+        t37.push(Raw::Sym('ㄅ'));
+        let (_, rest) = finalize_tail(&[], &t37, &lm, &capped, &cfg);
+        assert!(rest.len() >= TAIL_KEEP);
+        // Finalized syllables stay in front: the same cut on a tail that follows decided ones.
+        let (done, rest) = finalize_tail(&["ㄅㄚ".to_string(), "ㄅㄚ".to_string()], &tail40, &lm, &capped, &cfg);
+        assert_eq!((done.len(), rest.len()), (14, 12));
     }
 }

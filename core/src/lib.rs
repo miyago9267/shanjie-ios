@@ -16,6 +16,7 @@ mod trigram;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::OnceLock;
 
 pub const BEAM: usize = 32;
 pub const PER_KEY: usize = 12;
@@ -66,6 +67,45 @@ pub struct Lexicon {
     words: String,
     /// Entry positions of each distinct word's by_word winner, sorted by word bytes.
     by_word: Vec<u32>,
+    /// The toneless view (fluent-input contract section 3), built the first time `tl` is asked.
+    tl: OnceLock<Tl>,
+}
+
+/// The lexicon without tones, for the lattice decoder (fluent-input contract section 3): every syllable name reduced to its
+/// toneless id and its tone, and `index`, the readings sorted by their sequence of toneless ids (about 4 bytes per reading), so the
+/// readings that a chain of toneless syllables can spell are one contiguous range found by binary search.
+pub struct Tl {
+    /// Toneless names in id order: the symbols of the syllable in column order (initial, medial, final), no tone mark.
+    names: Vec<String>,
+    /// Per syllable id of the lexicon: its toneless id, and its tone (1 none, 2 ˊ, 3 ˇ, 4 ˋ, 5 ˙).
+    tl_of: Vec<u32>,
+    tone_of: Vec<u8>,
+    /// Reading numbers by toneless key (ties by reading number).
+    index: Vec<u32>,
+    /// The legal toneless syllables as column rows, with their toneless id: the plain-symbol names of the lexicon, without the 14 lone
+    /// initials that are symbol entries and not syllables (only ㄓㄔㄕㄖㄗㄘㄙ are).
+    rows: HashMap<syllable::Slots, u32>,
+}
+
+impl Tl {
+    /// The toneless id of a legal column row; `None` when no syllable spells it.
+    pub fn row_id(&self, slots: &syllable::Slots) -> Option<u32> {
+        self.rows.get(slots).copied()
+    }
+    /// The toneless name of an id.
+    pub fn name(&self, id: u32) -> &str {
+        &self.names[id as usize]
+    }
+    /// How many toneless names the lexicon has, and how many of them are legal syllables (`row_id` finds them).
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+    pub fn legal_len(&self) -> usize {
+        self.rows.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -241,7 +281,7 @@ impl Builder {
         }
         let by_word = winners.iter().map(|&f| pos[f as usize]).collect();
         let ents = order.iter().map(|&f| raw[f as usize].ent).collect();
-        let mut lex = Lexicon { max_len, syl_ids, syl_names, key_pool: fkeys, readings, ents, words, by_word };
+        let mut lex = Lexicon { max_len, syl_ids, syl_names, key_pool: fkeys, readings, ents, words, by_word, tl: OnceLock::new() };
         lex.words.shrink_to_fit();
         Ok(lex)
     }
@@ -276,6 +316,49 @@ impl Lexicon {
     }
     fn reading_of(&self, p: usize) -> usize {
         self.readings.partition_point(|r| r.start as usize <= p) - 1
+    }
+
+    /// The toneless view, built on first use (about 100 ms, 1.6 MB for the index).
+    pub fn tl(&self) -> &Tl {
+        self.tl.get_or_init(|| self.build_tl())
+    }
+
+    /// Toneless id and tone (1 none, 2 ˊ, 3 ˇ, 4 ˋ, 5 ˙) of a syllable name of the lexicon.
+    pub fn tl_syllable(&self, name: &str) -> Option<(u32, u8)> {
+        let id = *self.syl_ids.get(name)? as usize;
+        let tl = self.tl();
+        Some((tl.tl_of[id], tl.tone_of[id]))
+    }
+
+    fn build_tl(&self) -> Tl {
+        let (mut names, mut ids): (Vec<String>, HashMap<String, u32>) = (Vec::new(), HashMap::new());
+        let (mut tl_of, mut tone_of, mut rows) = (Vec::new(), Vec::new(), HashMap::new());
+        for name in &self.syl_names {
+            let marks = "ˊˇˋ˙";
+            tone_of.push(match name.chars().find(|c| marks.contains(*c)) {
+                Some('ˊ') => 2,
+                Some('ˇ') => 3,
+                Some('ˋ') => 4,
+                Some(_) => 5,
+                None => 1,
+            });
+            let mut slots: syllable::Slots = [None; 3];
+            let plain = name.chars().filter(|c| !marks.contains(*c)).all(|c| syllable::slot_of(c).is_some_and(|col| slots[col].replace(c).is_none()));
+            let key: String = if plain { slots.iter().flatten().collect() } else { name.chars().filter(|c| !marks.contains(*c)).collect() };
+            let id = *ids.entry(key.clone()).or_insert_with(|| {
+                names.push(key);
+                names.len() as u32 - 1
+            });
+            tl_of.push(id);
+            let lone_initial = slots[1].is_none() && slots[2].is_none() && slots[0].is_some_and(|c| !"ㄓㄔㄕㄖㄗㄘㄙ".contains(c));
+            if plain && slots.iter().any(Option::is_some) && !lone_initial {
+                rows.insert(slots, id);
+            }
+        }
+        let tl_key = |r: &Reading| self.key_of(r).iter().map(|&s| tl_of[s as usize]);
+        let mut index: Vec<u32> = (0..self.readings.len() as u32).collect();
+        index.sort_by(|&a, &b| tl_key(&self.readings[a as usize]).cmp(tl_key(&self.readings[b as usize])));
+        Tl { names, tl_of, tone_of, index, rows }
     }
 
     /// Every distinct syllable name in the lexicon (tone mark included), for `syllable::SylTable`.
