@@ -51,7 +51,7 @@ fn run() -> Result<(), String> {
             "--firsts" => firsts = Some(val()?),
             "--ios" => ios = true,
             "--fluency" => fluency = val()?.parse().map_err(|_| "bad number for --fluency")?,
-            "--feed" => feed = Feed::parse(&val()?).ok_or("--feed must be full, perm, omit1, tones or toneless")?,
+            "--feed" => feed = Feed::parse(&val()?).ok_or("--feed must be full, perm, omit1, tones, toneless or tonepart:P")?,
             "--seed" => seed = Some(val()?.parse().map_err(|_| "bad number for --seed")?),
             "--readings" => readings = Some(val()?),
             "--timing" => timing = true,

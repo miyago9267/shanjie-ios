@@ -1,8 +1,9 @@
 use cli::common::{dev_rows, format_rowstats, levenshtein, load_lenient, read_rows, root, three_field_rows};
+use cli::offline::{boundaries, cause, row_seed, run_row, Cause, OfflineFeed};
 use core::engine::{capping_overlay_detailed, load_lexicon_extra_detailed, load_lexicon_packs_detailed, PACK_ACG};
 use core::eval::*;
 use core::learn::{context_key, SENTINEL};
-use core::lm::{decode_from, history, CappedLexicon, Demote, Lm, Profile};
+use core::lm::{decode_from, history, CappedLexicon, Demote, LatticeCfg, Lm, Profile};
 use core::tinylm::{KnPairing, RerankLevel, TinyLm, TinyLmError, TOPK};
 use core::predict::{parse_units, predict, units_of, units_str, Index, Mode};
 use core::{decode_beam, Error, Lexicon, NoLearning, Syls, BEAM_S1};
@@ -174,6 +175,19 @@ struct RowOut {
     scores: String,
     dump: String,
     words: String,
+    lat: Option<LatOut>,
+}
+
+/// What a lattice row (`--feed`, `--toneless`) adds to the counters (fluent-input contract section 3, R2).
+struct LatOut {
+    keys: usize,
+    edges: usize,
+    bnd: (usize, usize),
+    in9: bool,
+    covered: bool,
+    times: Vec<Duration>,
+    /// For a row the syllable decoder gets right and the lattice does not: why.
+    lost: Option<Cause>,
 }
 
 /// S2c LM mode (docs/PLAN.md S2c): the one summary line of lm_eval.py, plus the optional `--dump` and `--rowstats`.
@@ -202,6 +216,10 @@ fn run_lm(args: &[String], len: &Lenient) -> Result<(), String> {
     let (mut packs, mut packs_dir) = (0u32, None::<String>);
     let mut extra_overlay = None::<String>;
     let mut threads = 1usize;
+    // Fluent-input contract section 1 and 3: `--ios` is the iOS keyboard's model setting (no trigram table, no word pack, no small
+    // model); `--feed MODE` / `--toneless` give every row to the lattice decoder as typed items instead of as syllables (`--seed` for the
+    // random feeds, `--timing` for the per-key cost on stderr).
+    let (mut ios, mut feed, mut seed, mut timing) = (false, None::<OfflineFeed>, 0u64, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().ok_or_else(|| "missing option value".to_string());
@@ -240,6 +258,11 @@ fn run_lm(args: &[String], len: &Lenient) -> Result<(), String> {
             "--no-kn" => kn = false,
             "--no-tri" => tri = false,
             "--no-names" => names = false,
+            "--ios" => ios = true,
+            "--toneless" => feed = Some(OfflineFeed::parse("toneless").expect("a known feed")),
+            "--feed" => feed = Some(OfflineFeed::parse(&val()?).ok_or("--feed must be syl, tones, toneless or tonepart:P")?),
+            "--seed" => seed = val()?.parse().map_err(|_| "bad number for --seed")?,
+            "--timing" => timing = true,
             "--packs" => packs |= pack_flag(&val()?)?,
             "--packs-dir" => packs_dir = Some(val()?),
             "--extra-overlay" => extra_overlay = Some(val()?),
@@ -253,6 +276,15 @@ fn run_lm(args: &[String], len: &Lenient) -> Result<(), String> {
     // Section 9 P3-8: without a small model a level (standard included) would silently measure the n-gram alone.
     if level.is_some() && tinylm.is_none() {
         return Err("--rerank-level needs --tinylm".into());
+    }
+    if ios && (tinylm.is_some() || packs != 0) {
+        return Err("--ios has no small model and no word pack".into());
+    }
+    if feed.is_some() && tinylm.is_some() {
+        return Err("--feed and --toneless do not take --tinylm".into());
+    }
+    if (timing || seed != 0) && feed.is_none() {
+        return Err("--timing and --seed need --feed or --toneless".into());
     }
     let level = level.unwrap_or(RerankLevel::Standard);
     if tinylm_scores.is_some() && set.as_deref() == Some("holdout") {
@@ -276,7 +308,7 @@ fn run_lm(args: &[String], len: &Lenient) -> Result<(), String> {
     // A kn.sjkn beside the model (docs/contracts/kn-core.md) turns the Kneser-Ney term on unless --no-kn. A trigram.sjt3 beside it
     // (docs/contracts/trigram-core.md) is read only for --profile formal and without --no-tri (chat never uses it, so it is not read
     // at all); the formal profile then scores with it and without Kneser-Ney. The kn.sjkn is read and checked either way.
-    let lm = Lm::load_opts(std::path::Path::new(&lm_path), classes, kn, tri && prof == Profile::Formal).map_err(|e| e.to_string())?;
+    let lm = Lm::load_opts(std::path::Path::new(&lm_path), classes, kn, tri && !ios && prof == Profile::Formal).map_err(|e| e.to_string())?;
     let scoring = lm.scoring(prof);
     let rss_before = tinylm.is_some().then(rss_kb).flatten();
     let tl = tinylm.as_deref().map(|p| load_tinylm(p, &lm, classes, demote)).transpose()?;
@@ -344,7 +376,22 @@ fn run_lm(args: &[String], len: &Lenient) -> Result<(), String> {
         // S2h: the first word is conditioned on the row's context, cut like the engine cuts it.
         let left = if ctx_mode { Some(context_key(ctx)) } else { None };
         let start = left.as_deref().filter(|k| *k != SENTINEL).map_or("<s>", |k| history(k, &lm));
-        let nb = decode_from(&capped, syls, &lm, prof, BEAM_S1, start, demote).map_err(|e| e.to_string())?;
+        let mut lat = None;
+        let nb = match feed {
+            None => decode_from(&capped, syls, &lm, prof, BEAM_S1, start, demote).map_err(|e| e.to_string())?,
+            Some(f) => {
+                let cfg = LatticeCfg { scoring, start, beam: BEAM_S1, demote };
+                let r = run_row(&capped, &lm, &cfg, syls, f, row_seed(seed, i), timing)?;
+                let (bnd, in9) = (boundaries(syls, &r.ends), r.paths.iter().take(9).any(|(_, ws)| len.apply(&ws.concat()) == len.apply(truth)));
+                let lost = {
+                    let base = decode_from(&capped, syls, &lm, prof, BEAM_S1, start, demote).map_err(|e| e.to_string())?;
+                    let top = |t: &str| len.apply(t) == len.apply(truth);
+                    (top(&base[0].1.concat()) && !r.paths.first().is_some_and(|(_, ws)| top(&ws.concat()))).then(|| cause(syls, &r))
+                };
+                lat = Some(LatOut { keys: r.keys, edges: r.edges, bnd, in9, covered: r.covered, times: r.times, lost });
+                if r.paths.is_empty() { vec![(0.0, vec![String::new()])] } else { r.paths }
+            }
+        };
         let mut surf: Vec<String> = nb.iter().map(|(_, ws)| ws.concat()).collect();
         let t = len.apply(truth);
         let mut out = RowOut::default();
@@ -391,15 +438,27 @@ fn run_lm(args: &[String], len: &Lenient) -> Result<(), String> {
             }
         }
         out.first = surf.swap_remove(chosen);
+        out.lat = lat;
         Ok(out)
     };
     let (mut top1, mut o64, mut firsts, mut rs, mut rerank, mut long) = (0usize, 0usize, Vec::new(), Vec::new(), Vec::new(), 0usize);
+    // (keys, edges, boundaries, found, oracle@9, uncovered rows) and the key times, summed over the lattice rows.
+    let (mut lat_sum, mut lat_times, mut lost) = ([0usize; 6], Vec::<Duration>::new(), [0usize; 3]);
     // Puts one row's output in the files and the counters; called in row order, so every file and the summary line are those of N = 1.
     let mut emit = |i: usize, out: RowOut| -> Result<(), String> {
         top1 += out.ok as usize;
         o64 += out.in64 as usize;
         long += out.long as usize;
         rerank.extend(out.rerank);
+        if let Some(l) = &out.lat {
+            for (a, b) in lat_sum.iter_mut().zip([l.keys, l.edges, l.bnd.0, l.bnd.1, l.in9 as usize, !l.covered as usize]) {
+                *a += b;
+            }
+            lat_times.extend(l.times.iter().copied());
+            if let Some(c) = l.lost {
+                lost[c as usize] += 1;
+            }
+        }
         if let Some(w) = scores.as_mut() {
             w.write_all(out.scores.as_bytes()).map_err(|_| "cannot write tinylm scores".to_string())?;
         }
@@ -504,6 +563,21 @@ fn run_lm(args: &[String], len: &Lenient) -> Result<(), String> {
     if let Some(mut f) = rowstats {
         f.write_all(format_rowstats(&rs).as_bytes()).map_err(|e| format!("cannot write rowstats ({:?})", e.kind()))?;
     }
+    if let Some(f) = feed {
+        let [keys, edges, bt, bf, o9, un] = lat_sum;
+        eprintln!(
+            "lattice: feed {f} seed {seed}: keys {keys}, edges/key {:.2}, boundaries {bf}/{bt} ({:.1}%), oracle@9 {o9}/{}, uncovered rows {un}",
+            edges as f64 / keys.max(1) as f64,
+            100.0 * bf as f64 / bt.max(1) as f64,
+            rows.len()
+        );
+        eprintln!("lost against the syllable decoder: segmentation {}, tone {}, ranking {}", lost[0], lost[1], lost[2]);
+        if timing && !lat_times.is_empty() {
+            lat_times.sort();
+            let ms = |d: Duration| d.as_secs_f64() * 1e3;
+            eprintln!("keys: p95 {:.3} ms max {:.3} ms", ms(lat_times[lat_times.len() * 95 / 100]), ms(lat_times[lat_times.len() - 1]));
+        }
+    }
     let sha = sha256_hex(firsts.join("\n").as_bytes());
     // A non-standard level is a different setting from the shipping one: tools/bench.py and tools/triage.py compare the whole tag, so it fails their cells.
     let rl_tag = match level {
@@ -511,7 +585,9 @@ fn run_lm(args: &[String], len: &Lenient) -> Result<(), String> {
         RerankLevel::Conservative => "+rl:conservative",
         RerankLevel::Aggressive => "+rl:aggressive",
     };
-    println!("## {name}  lm-{profile_name}{}{}{}{}{}{}{}{}{xo}{}  {{'n': {}, 'top1': {top1}, 'oracle@64': {o64}, 'top1_sha256': '{sha}'}}", if ctx_mode { "+ctx" } else { "" }, if demote { "" } else { "-nodemote" }, if classes { "" } else { "-noclasses" }, if names { "" } else { "-nonames" }, if scoring.kn { lm.kn_tag().unwrap_or("") } else { "" }, tl.as_ref().map_or(String::new(), |(_, _, sha8)| format!("+tl:{sha8}")), rl_tag, if packs & PACK_ACG != 0 { "+acg" } else { "" }, if scoring.tri { lm.tri_tag().unwrap_or("") } else { "" }, rows.len());
+    // Only the new options add to the tag, so every earlier run keeps its label.
+    let ios_tag = format!("{}{}", if ios { "+ios" } else { "" }, feed.map_or(String::new(), |f| format!("+feed:{f}+seed:{seed}")));
+    println!("## {name}  lm-{profile_name}{}{}{}{}{}{}{}{}{xo}{}{ios_tag}  {{'n': {}, 'top1': {top1}, 'oracle@64': {o64}, 'top1_sha256': '{sha}'}}", if ctx_mode { "+ctx" } else { "" }, if demote { "" } else { "-nodemote" }, if classes { "" } else { "-noclasses" }, if names { "" } else { "-nonames" }, if scoring.kn { lm.kn_tag().unwrap_or("") } else { "" }, tl.as_ref().map_or(String::new(), |(_, _, sha8)| format!("+tl:{sha8}")), rl_tag, if packs & PACK_ACG != 0 { "+acg" } else { "" }, if scoring.tri { lm.tri_tag().unwrap_or("") } else { "" }, rows.len());
     Ok(())
 }
 

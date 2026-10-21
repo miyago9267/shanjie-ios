@@ -63,6 +63,8 @@ pub enum Feed {
     Tones,
     /// No tone key and no Space at all.
     Toneless,
+    /// Like `Tones`, but each tone key is typed only with the probability (in millionths) it carries (`tonepart:P`).
+    TonePart(u32),
 }
 
 impl Feed {
@@ -73,15 +75,18 @@ impl Feed {
             "omit1" => Feed::Omit1,
             "tones" => Feed::Tones,
             "toneless" => Feed::Toneless,
-            _ => return None,
+            _ => {
+                let p: f64 = s.strip_prefix("tonepart:")?.parse().ok()?;
+                (0.0..=1.0).contains(&p).then(|| Feed::TonePart((p * 1e6).round() as u32))?
+            }
         })
     }
 }
 
 /// splitmix64: a seed that gives the same keys on every run and machine.
-struct Rng(u64);
+pub struct Rng(pub u64);
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -90,36 +95,49 @@ impl Rng {
     }
 }
 
-/// The keys of one syllable: its symbols, then its tone key (Space for the first tone). `None` for a symbol without a key.
-pub fn keys_of(syl: &str) -> Option<Vec<Key>> {
-    let layout = Layout::Standard;
-    let (mut v, mut toned) = (Vec::new(), false);
-    for c in syl.chars() {
-        match layout.key_of_tone(c) {
-            Some(tk) => {
-                v.push(Key::ch(tk, 0));
-                toned = true;
-            }
-            None => v.push(Key::ch(layout.key_of_symbol(c)?, 0)),
-        }
-    }
-    if !toned {
-        v.push(Key::new(KeyKind::Space));
-    }
-    Some(v)
+/// One typed thing before it is a key: a symbol, a tone mark (ˊˇˋ˙), or Space (the first tone).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unit {
+    Sym(char),
+    Tone(char),
+    Space,
 }
 
-/// The keys of syllable `i` of `n` under `feed`; `rng` is only used by `Feed::Perm`.
-fn feed_keys(syl: &str, i: usize, n: usize, feed: Feed, rng: &mut Rng) -> Option<Vec<Key>> {
+/// The key of a unit; `None` for a symbol or tone mark without a key.
+pub fn key_of_unit(u: Unit) -> Option<Key> {
+    let layout = Layout::Standard;
+    Some(match u {
+        Unit::Sym(c) => Key::ch(layout.key_of_symbol(c)?, 0),
+        Unit::Tone(c) => Key::ch(layout.key_of_tone(c)?, 0),
+        Unit::Space => Key::new(KeyKind::Space),
+    })
+}
+
+/// The keys of one syllable: its symbols, then its tone key (Space for the first tone). `None` for a symbol without a key.
+pub fn keys_of(syl: &str) -> Option<Vec<Key>> {
+    units_of(syl).into_iter().map(key_of_unit).collect()
+}
+
+fn units_of(syl: &str) -> Vec<Unit> {
+    let mut v: Vec<Unit> = syl.chars().map(|c| if Layout::Standard.key_of_tone(c).is_some() { Unit::Tone(c) } else { Unit::Sym(c) }).collect();
+    if !v.iter().any(|u| matches!(u, Unit::Tone(_))) {
+        v.push(Unit::Space);
+    }
+    v
+}
+
+/// The units of syllable `i` of `n` under `feed`; `rng` is only used by `Feed::Perm` and `Feed::TonePart`. The one place the feeds are
+/// defined: the replay turns the units into keys, the offline lattice tools into `syllable::Raw`.
+pub fn feed_units(syl: &str, i: usize, n: usize, feed: Feed, rng: &mut Rng) -> Option<Vec<Unit>> {
     if feed == Feed::Full {
-        return keys_of(syl);
+        return Some(units_of(syl));
     }
     let layout = Layout::Standard;
     let (mut syms, mut tone) = (Vec::new(), None);
     for c in syl.chars() {
         match layout.key_of_tone(c) {
-            Some(tk) => tone = Some(tk),
-            None => syms.push(Key::ch(layout.key_of_symbol(c)?, 0)),
+            Some(_) => tone = Some(c),
+            None => syms.push(Unit::Sym(c)),
         }
     }
     if feed == Feed::Perm {
@@ -128,12 +146,22 @@ fn feed_keys(syl: &str, i: usize, n: usize, feed: Feed, rng: &mut Rng) -> Option
         }
     }
     match (feed, tone) {
-        (_, Some(tk)) if feed != Feed::Toneless => syms.push(Key::ch(tk, 0)),
-        (Feed::Perm, None) => syms.push(Key::new(KeyKind::Space)),
-        (Feed::Omit1, None) if i + 1 == n => syms.push(Key::new(KeyKind::Space)),
+        (Feed::TonePart(p), Some(t)) => {
+            if (rng.next() % 1_000_000) < p as u64 {
+                syms.push(Unit::Tone(t));
+            }
+        }
+        (_, Some(t)) if feed != Feed::Toneless => syms.push(Unit::Tone(t)),
+        (Feed::Perm, None) => syms.push(Unit::Space),
+        (Feed::Omit1, None) if i + 1 == n => syms.push(Unit::Space),
         _ => {}
     }
     Some(syms)
+}
+
+/// The keys of syllable `i` of `n` under `feed`; `rng` is only used by `Feed::Perm`.
+fn feed_keys(syl: &str, i: usize, n: usize, feed: Feed, rng: &mut Rng) -> Option<Vec<Key>> {
+    feed_units(syl, i, n, feed, rng)?.into_iter().map(key_of_unit).collect()
 }
 
 /// Keys to bring the cursor from `from` to `to` among `n` syllables: Left/Right one syllable each, or Home / End first.
@@ -470,6 +498,17 @@ mod tests {
         // Tones: tone key kept, Space never. Toneless: neither.
         assert_eq!(row(Feed::Tones, 1, &s), [k("ㄊㄚ").trim_end_matches('_').to_string(), k("ㄇㄣ˙"), k("ㄏㄠˇ")]);
         assert_eq!(row(Feed::Toneless, 1, &s), [k("ㄊㄚ").trim_end_matches('_').to_string(), k("ㄇㄣ˙")[..2].to_string(), k("ㄏㄠˇ")[..2].to_string()]);
+    }
+
+    #[test]
+    fn tonepart_keeps_each_tone_key_with_its_probability() {
+        assert_eq!(Feed::parse("tonepart:0.5"), Some(Feed::TonePart(500_000)));
+        assert!(Feed::parse("tonepart:1.5").is_none() && Feed::parse("tonepart:x").is_none());
+        let s = ["ㄍㄨㄛˇ", "ㄏㄨㄞˋ", "ㄒㄧㄠ", "ㄇㄚˇ", "ㄇㄚˋ", "ㄇㄚˊ"];
+        assert_eq!(row(Feed::TonePart(0), 5, &s), row(Feed::Toneless, 5, &s));
+        assert_eq!(row(Feed::TonePart(1_000_000), 5, &s), row(Feed::Tones, 5, &s));
+        assert_eq!(row(Feed::TonePart(500_000), 5, &s), row(Feed::TonePart(500_000), 5, &s));
+        assert!((0..20).any(|k| row(Feed::TonePart(500_000), k, &s) != row(Feed::Tones, k, &s)));
     }
 
     #[test]
