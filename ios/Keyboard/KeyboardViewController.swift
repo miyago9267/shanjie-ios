@@ -316,7 +316,7 @@ final class KeyboardViewController: UIInputViewController {
         for (r, row) in Self.rows.enumerated() {
             let s = KeyRow()
             s.inset = insets[r]
-            s.total = r == 1 ? 10 + 1 : 11
+            s.total = r == 1 ? 10 + 1 : r == 3 ? 11.5 : 11
             for (label, ascii) in row {
                 let b = key(label)
                 b.tag = Int(ascii.unicodeScalars.first!.value)
@@ -329,7 +329,7 @@ final class KeyboardViewController: UIInputViewController {
                 back.addTarget(self, action: #selector(backDown), for: .touchDown)
                 back.addTarget(self, action: #selector(backUp), for: [.touchUpInside, .touchUpOutside, .touchCancel])
                 back.addTarget(self, action: #selector(feedback), for: .touchDown)
-                s.add(back)
+                s.add(back, units: 1.5)
             }
             addRowHeight(s)
             root.addArrangedSubview(s)
